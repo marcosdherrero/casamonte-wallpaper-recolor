@@ -1,0 +1,12 @@
+TY  - JOUR
+AU  - Hateley, James
+AU  - Wei, Huayi
+AU  - Chen, Long
+PY  - 2014/04/01
+SP  - 
+N2  - A Centroidal Voronoi tessellation (CVT) is a Voronoi tessellation in which the generators are the centroids for each Voronoi region. CVTs have many applications to computer graphics, image processing, data compression, mesh generation, and optimal quantization. Lloyd’s method, the most widely method used to generate CVTs, converges very slowly for larger scale problems. Recently quasi-Newton methods using the Hessian of the associated energy as a preconditioner are developed to speed up the rate of convergence. In this work a graph Laplacian preconditioner and a two-grid method are used to speed up quasi-Newton schemes. The proposed graph Laplacian is always symmetric, positive definite and easy to assemble, while the Hessian, in general, may not be positive definite nor easy to assemble. The two-grid method, in which an optimization method using a relaxed stopping criteria is applied on a coarse grid, and then the coarse grid is refined to generate a better initial guess in the fine grid, will further speed up the convergence and lower the energy. Numerical tests show that our preconditioned two-grid optimization methods converges fast and has nearly linear complexity.
+T1  - Fast Methods for Computing Centroidal Voronoi Tessellations
+VL  - 63
+DO  - 10.1007/s10915-014-9894-1
+JO  - Journal of Scientific Computing
+ER  - 

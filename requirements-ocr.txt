@@ -1,0 +1,10 @@
+# Optional Detect / Remove extras (Pillow + numpy remain the base install).
+# pip install -r requirements-ocr.txt
+#
+# EasyOCR Detect, OpenCV mask morphology + Navier–Stokes inpaint, LaMa via
+# onnxruntime when wallpaper_recolor/models/lama.onnx is cached:
+#   python -c "from wallpaper_recolor.transform.lama_onnx import download_lama_onnx; download_lama_onnx()"
+opencv-python>=4.8.0
+easyocr>=1.7.0
+onnxruntime>=1.16.0
+numpy>=1.26.0

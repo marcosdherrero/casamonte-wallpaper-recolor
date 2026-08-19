@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.DS_Store
+Thumbs.db
+presets.json
+layout_profiles.json
+wallpaper_recolor/models/*.onnx
+wallpaper_recolor/models/*.onnx.part
+Wallpapers/**/*.tif
+Wallpapers/**/*.tiff
+**/*_jobpack/
+*.wpedit
+**/*.wpedit

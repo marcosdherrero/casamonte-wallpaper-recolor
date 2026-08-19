@@ -1,0 +1,3 @@
+# Desktop wallpaper recolor app — Pillow for TIF/PNG/JPEG, numpy for range maps
+Pillow>=10.0.0
+numpy>=1.26.0

@@ -1,0 +1,5 @@
+# Optional Clusters tab 3D Lab scatter (Pillow + numpy remain the base install).
+# pip install -r requirements-plot.txt
+#
+# Without matplotlib the Clusters tab draws a 2D a*–b* canvas instead.
+matplotlib>=3.8.0
