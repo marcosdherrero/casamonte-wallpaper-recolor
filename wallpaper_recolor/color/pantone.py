@@ -15,13 +15,13 @@ from __future__ import annotations  # tuple[int, int, int] without quoting
 
 import json
 import re
-from pathlib import Path
 
 import numpy as np
 
+from wallpaper_recolor.paths import package_dir
 from wallpaper_recolor.color.color_math import rgb_to_lab_array
 
-_JSON_PATH = Path(__file__).resolve().parent / "pantone_hex.json"
+_JSON_PATH = package_dir() / "color" / "pantone_hex.json"
 _BOOK_SUFFIXES = frozenset({"c", "u", "tcx", "tpx", "tpg", "tpn", "tp", "cp", "up"})
 _FASHION_CODE = re.compile(r"\b(\d{2}-\d{4})(?:\s+(tpx|tcx|tpg|tpn|tp))?\b")
 

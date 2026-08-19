@@ -12,8 +12,7 @@ Class references (code + name only):
 
 from __future__ import annotations
 
-from pathlib import Path
-
+from wallpaper_recolor.paths import package_dir
 from wallpaper_recolor.color.color_ranges import (
     ASSIGN_KMEANS,
     ASSIGN_KMEANS_LABEL,
@@ -118,7 +117,7 @@ _WHEEL_CLASS_TAGS = (
     "Text",
 )
 # FA icons live in wallpaper_recolor/icons/ (SVG source + cached PNG)
-_ICONS_DIR = Path(__file__).resolve().parents[1] / "icons"
+_ICONS_DIR = package_dir() / "icons"
 # FA rotate-left (rotate-left-solid-full.svg) rasterized for slider reset icons
 _RESET_ICON_PX = 18
 _RESET_ICON_FG = (34, 34, 34, 255)

@@ -20,6 +20,7 @@ from pathlib import Path
 import json
 import re
 
+from wallpaper_recolor.paths import user_data_dir
 from wallpaper_recolor.color.color_ranges import (
     ALLOWED_SPLIT_METHODS,
     RANGE_BY_COLOR_LABEL,
@@ -142,9 +143,8 @@ def split_label_for(method: str) -> str:
 
 
 def default_presets_path() -> Path:
-    """presets.json beside run_app.py (project folder, parent of this package)."""
-    # color/presets.py → wallpaper_recolor → repo root
-    return Path(__file__).resolve().parents[2] / PRESETS_FILENAME
+    """presets.json beside run_app.py, or beside the .exe when frozen."""
+    return user_data_dir() / PRESETS_FILENAME
 
 
 def v6n_preset() -> PalettePreset:

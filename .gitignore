@@ -14,3 +14,9 @@ Wallpapers/**/*.tiff
 **/*_jobpack/
 *.wpedit
 **/*.wpedit
+build/
+dist/
+release/
+runtime/
+.cache/
+*.nupkg
