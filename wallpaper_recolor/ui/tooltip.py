@@ -28,6 +28,7 @@ _ATTR = "_hover_tip"
 _GWL_EXSTYLE = -20
 _WS_EX_NOACTIVATE = 0x08000000
 _WS_EX_TOOLWINDOW = 0x00000080
+_WS_EX_TRANSPARENT = 0x00000020  # click-through so the balloon cannot eat hover/wheel
 
 TextSpec = str | Callable[..., str | None]
 
@@ -102,6 +103,8 @@ class HoverTip:
                 pass
 
     def _on_enter(self, event=None) -> None:
+        if not self._pointer_inside_widget():
+            return
         self._schedule(event)
 
     def _on_motion(self, event=None) -> None:
@@ -203,6 +206,8 @@ class HoverTip:
             takefocus=0,
         )
         label.pack()
+        setattr(win, "_wp_tooltip", True)
+        setattr(label, "_wp_tooltip", True)
         self._win = win
         self._label = label
 
@@ -276,6 +281,162 @@ def bind_tooltip(
     return tip
 
 
+_MENU_TIPS_ATTR = "_wp_menu_tips"
+
+
+def bind_menu_tooltips(
+    menu: tk.Menu,
+    tips: dict[int, str],
+    *,
+    delay_ms: int = 150,
+    wraplength: int = 320,
+) -> None:
+    """Hover balloon for posted Tk menu items (``<<MenuSelect>>``)."""
+    setattr(menu, _MENU_TIPS_ATTR, dict(tips))
+    existing = getattr(menu, _ATTR, None)
+    if isinstance(existing, _MenuItemTip):
+        existing.tips = dict(tips)
+        existing.delay_ms = max(0, int(delay_ms))
+        existing.wraplength = int(wraplength)
+        return
+    tip = _MenuItemTip(menu, tips, delay_ms=delay_ms, wraplength=wraplength)
+    setattr(menu, _ATTR, tip)
+
+
+class _MenuItemTip:
+    """Balloon that follows the active item of a posted ``tk.Menu``."""
+
+    def __init__(
+        self,
+        menu: tk.Menu,
+        tips: dict[int, str],
+        *,
+        delay_ms: int = 150,
+        wraplength: int = 320,
+    ) -> None:
+        self.menu = menu
+        self.tips = dict(tips)
+        self.delay_ms = max(0, int(delay_ms))
+        self.wraplength = int(wraplength)
+        self._job: str | None = None
+        self._win: tk.Toplevel | None = None
+        self._label: tk.Label | None = None
+        menu.bind("<<MenuSelect>>", self._on_select, add="+")
+        menu.bind("<Unmap>", self._on_unmap, add="+")
+
+    def hide(self) -> None:
+        self._cancel_job()
+        win = self._win
+        self._win = None
+        self._label = None
+        if win is not None:
+            try:
+                win.destroy()
+            except tk.TclError:
+                pass
+
+    def _on_unmap(self, _event=None) -> None:
+        self.hide()
+
+    def _on_select(self, _event=None) -> None:
+        try:
+            index = self.menu.index("active")
+        except tk.TclError:
+            self.hide()
+            return
+        if index is None or index == "none":
+            self.hide()
+            return
+        try:
+            caption = str(self.tips.get(int(index), "") or "").strip()
+        except (TypeError, ValueError):
+            caption = ""
+        if not caption:
+            self.hide()
+            return
+        self._cancel_job()
+        try:
+            self._job = self.menu.after(self.delay_ms, lambda: self._show(caption))
+        except tk.TclError:
+            self._job = None
+
+    def _cancel_job(self) -> None:
+        job = self._job
+        self._job = None
+        if job is not None:
+            try:
+                self.menu.after_cancel(job)
+            except tk.TclError:
+                pass
+
+    def _show(self, caption: str) -> None:
+        self._job = None
+        if not caption:
+            return
+        try:
+            if not self.menu.winfo_exists():
+                return
+        except tk.TclError:
+            return
+        if self._win is None:
+            try:
+                win = tk.Toplevel(self.menu)
+            except tk.TclError:
+                return
+            win.withdraw()
+            win.wm_overrideredirect(True)
+            try:
+                win.wm_attributes("-topmost", True)
+            except tk.TclError:
+                pass
+            label = tk.Label(
+                win,
+                text="",
+                bg=_TIP_BG,
+                fg=_TIP_FG,
+                relief="solid",
+                bd=1,
+                font=_TIP_FONT,
+                justify="left",
+                wraplength=self.wraplength,
+                padx=6,
+                pady=3,
+                takefocus=0,
+            )
+            label.pack()
+            setattr(win, "_wp_tooltip", True)
+            self._win = win
+            self._label = label
+        if self._label is not None:
+            try:
+                self._label.configure(text=caption, wraplength=self.wraplength)
+            except tk.TclError:
+                return
+        win = self._win
+        if win is None:
+            return
+        try:
+            win.update_idletasks()
+            tw = int(win.winfo_reqwidth())
+            th = int(win.winfo_reqheight())
+            sw = int(self.menu.winfo_screenwidth())
+            sh = int(self.menu.winfo_screenheight())
+            x = int(self.menu.winfo_pointerx()) + 16
+            y = int(self.menu.winfo_pointery()) + 12
+            x = max(0, min(x, sw - tw - 4))
+            y = max(0, min(y, sh - th - 4))
+            win.wm_geometry(f"+{x}+{y}")
+            _no_activate(win)
+            win.deiconify()
+            try:
+                win.lift()
+            except tk.TclError:
+                pass
+            _no_activate(win)
+        except tk.TclError:
+            self.hide()
+
+
 def _snapshot(event) -> SimpleNamespace | None:
     if event is None:
         return None
@@ -300,6 +461,10 @@ def _no_activate(win: tk.Toplevel) -> None:
         getter = getattr(user32, "GetWindowLongPtrW", None) or user32.GetWindowLongW
         setter = getattr(user32, "SetWindowLongPtrW", None) or user32.SetWindowLongW
         style = getter(hwnd, _GWL_EXSTYLE)
-        setter(hwnd, _GWL_EXSTYLE, int(style) | _WS_EX_NOACTIVATE | _WS_EX_TOOLWINDOW)
+        setter(
+            hwnd,
+            _GWL_EXSTYLE,
+            int(style) | _WS_EX_NOACTIVATE | _WS_EX_TOOLWINDOW | _WS_EX_TRANSPARENT,
+        )
     except Exception:
         pass

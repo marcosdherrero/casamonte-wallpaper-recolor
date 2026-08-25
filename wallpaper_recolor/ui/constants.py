@@ -13,6 +13,7 @@ Class references (code + name only):
 from __future__ import annotations
 
 from wallpaper_recolor.paths import package_dir
+from wallpaper_recolor.io.proof import DEFAULT_ICC_PROFILES_DIR
 from wallpaper_recolor.color.color_ranges import (
     ASSIGN_KMEANS,
     ASSIGN_KMEANS_LABEL,
@@ -21,6 +22,7 @@ from wallpaper_recolor.color.color_ranges import (
     RANGE_BY_COLOR_LABEL,
     RANGE_BY_LAB_A_LABEL,
     RANGE_BY_LAB_B_LABEL,
+    RANGE_BY_LAB_C_LABEL,
     RANGE_BY_LAB_L_LABEL,
     RANGE_BY_LUMA_LABEL,
     SPLIT_EQUAL_LIGHTNESS,
@@ -31,8 +33,8 @@ from wallpaper_recolor.color.color_ranges import (
     SPLIT_LAB_A_PIXELS,
     SPLIT_LAB_B_EQUAL,
     SPLIT_LAB_B_PIXELS,
-    SPLIT_LAB_L_EQUAL,
-    SPLIT_LAB_L_PIXELS,
+    SPLIT_LAB_C_EQUAL,
+    SPLIT_LAB_C_PIXELS,
 )
 from wallpaper_recolor.transform.tessellate import (
     SIDE_BOTTOM,
@@ -67,7 +69,8 @@ TONE_KNOB_GROWTH = 2.2
 TONE_KNOB_REF_PX = 110.0
 TONE_KNOB_STEP = 0.1
 _MIN_PANE_FOR_FIT = 16  # ignore unmapped / 1×1 widgets when fitting
-PREVIEW_PANE_BG = "#2a2a2a"  # letterbox / pillarbox (same on Original and Result)
+# Letterbox / pillarbox — ttk TFrame chrome, not a dark void around a fitted image
+PREVIEW_PANE_BG = "#f0f0f0"
 _PREVIEW_PAN_DRAG_PX = 4
 # Longest edge used to build the interactive range map (not the saved file)
 WORK_MAX_EDGE = 1600
@@ -80,6 +83,7 @@ CLUSTER_DEBOUNCE_MS = 120  # Lab scatter; keep wheel/coverage drags off the Tk t
 _LAYER_SWATCH_PX = 16
 _LAYER_TWISTY_OPEN = "▾"
 _LAYER_TWISTY_SHUT = "▸"
+_LAYER_KEBAB = "⋯"  # range-row overflow (Remove, …)
 CHIP_COLUMNS = 6  # compact range chips wrap under the coverage bar
 DEFAULT_MOCKUP_REPEATS = 4.0
 DEFAULT_MOCKUP_COVER = "full"
@@ -95,6 +99,18 @@ _PANEL_BAR_FG = "#222222"
 _SNAP_HIGHLIGHT = "#4a90d9"
 _INSERT_MARKER_BG = "#2d6bb3"
 _COL_IDLE_BORDER = "#c8c8c8"
+# Preview notebook tabs — vista's native tab is pale; clam-drawn tabs keep contrast
+PREVIEW_NOTEBOOK_STYLE = "Preview.TNotebook"
+PREVIEW_TAB_FONT = ("Segoe UI", 9)
+PREVIEW_TAB_FONT_SELECTED = ("Segoe UI", 9, "bold")
+PREVIEW_TAB_SELECTED_BG = "#ffffff"
+PREVIEW_TAB_SELECTED_FG = _PANEL_BAR_FG
+PREVIEW_TAB_IDLE_BG = "#d0d0d0"
+PREVIEW_TAB_IDLE_FG = "#5c5c5c"
+PREVIEW_TAB_ACCENT = _INSERT_MARKER_BG
+PREVIEW_TAB_BORDER = _COL_IDLE_BORDER
+PREVIEW_TAB_PADDING = (11, 5)
+PREVIEW_TAB_PADDING_SELECTED = (13, 7)
 # Widget bind + bind_all: ttk.Scale/Notebook eat MouseWheel before bind_all (last bindtag)
 _COLUMN_SCROLL_TAG = "WallpaperColScroll"
 # Replace (do not add=+) these class binds so the Scale default cannot nudge the value
@@ -187,13 +203,13 @@ _TESS_V_TIPS = {
     SIDE_BOTTOM: "Use the bottom edge as the source; the opposite edge is the model.",
 }
 
-# Range by: k-means, Rec. 709 luma, or CIE Lab axis bins
+# Range by: k-means, Rec. 709 luma, CIELAB a* / b* / C*ab bins (L* is luma)
 RANGE_BY_LABELS = (
     RANGE_BY_COLOR_LABEL,  # k-means / nearest Lab — similar colors
     RANGE_BY_LUMA_LABEL,  # Rec. 709 light / mid / dark
-    RANGE_BY_LAB_L_LABEL,
     RANGE_BY_LAB_A_LABEL,
     RANGE_BY_LAB_B_LABEL,
+    RANGE_BY_LAB_C_LABEL,
 )
 # Shown when Range by is Color closeness — k-means vs nearest palette hex
 ASSIGN_LABELS = (ASSIGN_KMEANS_LABEL, ASSIGN_PALETTE_LABEL)
@@ -212,9 +228,13 @@ LUMA_SPLIT_LABELS = {
 }
 _RANGE_BY_BIN_METHODS = {
     RANGE_BY_LUMA_LABEL: (SPLIT_EQUAL_LIGHTNESS, SPLIT_EQUAL_PIXELS),
-    RANGE_BY_LAB_L_LABEL: (SPLIT_LAB_L_EQUAL, SPLIT_LAB_L_PIXELS),
+    RANGE_BY_LAB_L_LABEL: (SPLIT_EQUAL_LIGHTNESS, SPLIT_EQUAL_PIXELS),  # leftover L*
     RANGE_BY_LAB_A_LABEL: (SPLIT_LAB_A_EQUAL, SPLIT_LAB_A_PIXELS),
     RANGE_BY_LAB_B_LABEL: (SPLIT_LAB_B_EQUAL, SPLIT_LAB_B_PIXELS),
+    RANGE_BY_LAB_C_LABEL: (SPLIT_LAB_C_EQUAL, SPLIT_LAB_C_PIXELS),
+    "a*": (SPLIT_LAB_A_EQUAL, SPLIT_LAB_A_PIXELS),  # leftover short labels
+    "b*": (SPLIT_LAB_B_EQUAL, SPLIT_LAB_B_PIXELS),
+    "C*": (SPLIT_LAB_C_EQUAL, SPLIT_LAB_C_PIXELS),
 }
 # Default dock: every pane visible. View can still hide; Reset layout restores this.
 JOB_HIDDEN_PANEL_TITLES = frozenset()

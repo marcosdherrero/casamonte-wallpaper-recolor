@@ -67,6 +67,7 @@ from wallpaper_recolor.color.color_ranges import (
     set_range_weight,
     snapshot_assignment,
     sync_centers_from_match,
+    canonicalize_split_method,
 )
 from wallpaper_recolor.ui.color_wheel import ColorWheel, rgb_to_hex
 from wallpaper_recolor.ui.cluster_view import (
@@ -382,6 +383,7 @@ class AppSessionMixin:
             messagebox.showerror("Could not save Edit state", str(exc), parent=self.root)
             return False
         self._edit_state_path = dest
+        self._mark_session_clean()
         self.status.set(f"Saved Edit state {dest.name}")
         return True
 
@@ -401,6 +403,20 @@ class AppSessionMixin:
             messagebox.showerror("Could not open Edit state", str(exc), parent=self.root)
             return
         self._edit_state_path = Path(path)
+
+    def _session_state_snapshot(self) -> object:
+        """Canonical session payload used to detect unsaved edits."""
+        return json.loads(json.dumps(self._capture_session_state()))
+
+    def _mark_session_clean(self) -> None:
+        """Treat the current session as matching the last successful save/load."""
+        self._saved_session_state = self._session_state_snapshot()
+
+    def _edit_state_is_dirty(self) -> bool:
+        """True when closing would lose work that is not in the last saved session."""
+        if self._saved_session_state is None:
+            return self.source_image is not None or self.range_map is not None
+        return self._session_state_snapshot() != self._saved_session_state
 
     def _write_edit_state(self, path: Path) -> None:
         path = Path(path)
@@ -442,7 +458,9 @@ class AppSessionMixin:
             "version": EDIT_STATE_VERSION,
             "image_path": str(self.source_path) if self.source_path is not None else "",
             "preset_id": self.preset_id,
-            "split_method": self._split_method() if snap is None else snap.split_method,
+            "split_method": canonicalize_split_method(
+                self._split_method() if snap is None else snap.split_method
+            ),
             "assignment_mode": self._assign_mode() if snap is None else getattr(snap, "assignment_mode", ASSIGN_KMEANS),
             "range_count": int(self._requested_count() if snap is None else snap.range_count),
             "bin_start": None if snap is None else getattr(snap, "bin_start", None),
@@ -653,7 +671,9 @@ class AppSessionMixin:
 
         n_ranges = int(data.get("range_count") or len(range_rows) or DEFAULT_RANGES)
         n_ranges = max(MIN_RANGES, min(MAX_RANGES, n_ranges))
-        split_method = str(data.get("split_method") or SPLIT_COLOR_CLOSENESS)
+        split_method = canonicalize_split_method(
+            data.get("split_method") or SPLIT_COLOR_CLOSENESS
+        )
         assignment_mode = str(data.get("assignment_mode") or ASSIGN_KMEANS)
         if assignment_mode not in (ASSIGN_KMEANS, ASSIGN_PALETTE):
             assignment_mode = ASSIGN_KMEANS
@@ -805,6 +825,7 @@ class AppSessionMixin:
         self.wheel.set_history(data.get("color_history"))
         self._clear_history()
         self._refresh_now()
+        self._mark_session_clean()
 
     def _save_uses_grain(self) -> bool:
         """True when Result is Color/Luminosity grain (texture eye on and slider > 0)."""
@@ -835,6 +856,7 @@ class AppSessionMixin:
         tess_mode: str,
         tess_tiles: int,
         tess_lloyd: int,
+        tess_normalize: bool = False,
         stack: LayerStack | None = None,
         selected_ids: tuple[str, ...] | None = None,
         inpaint_layer_id: str | None = None,
@@ -888,6 +910,7 @@ class AppSessionMixin:
                     mode=tess_mode,
                     tiles=tess_tiles,
                     lloyd=tess_lloyd,
+                    normalize_lighting=tess_normalize,
                 )
             elif ly.is_base():
                 img = apply_crop(img, crop_x, crop_y, crop_zoom)
@@ -913,6 +936,7 @@ class AppSessionMixin:
                 mode=tess_mode,
                 tiles=tess_tiles,
                 lloyd=tess_lloyd,
+                normalize_lighting=tess_normalize,
             )
         sample = next(iter(processed.values()))
         base = stack.base_layer()
@@ -983,6 +1007,7 @@ class AppSessionMixin:
                 tess_mode=tess_mode,
                 tess_tiles=tess_tiles,
                 tess_lloyd=tess_lloyd,
+                tess_normalize=self._tess_normalize_on(),
                 stack=stack,
                 selected_ids=selected_ids,
                 inpaint_layer_id=hole_layer,
@@ -1139,6 +1164,7 @@ class AppSessionMixin:
                 tess_mode=tess_mode,
                 tess_tiles=tess_tiles,
                 tess_lloyd=tess_lloyd,
+                tess_normalize=tess_normalize,
                 stack=stack,
                 selected_ids=selected_ids,
                 inpaint_layer_id=hole_layer,
@@ -1217,7 +1243,7 @@ class AppSessionMixin:
             tone_balance_cyan=float(getattr(rm, "tone_balance_cyan", getattr(rm, "tone_lights_cyan", 0.0))),
             tone_balance_magenta=float(getattr(rm, "tone_balance_magenta", getattr(rm, "tone_lights_magenta", 0.0))),
             tone_balance_yellow=float(getattr(rm, "tone_balance_yellow", getattr(rm, "tone_lights_yellow", 0.0))),
-            split_method=rm.split_method,
+            split_method=canonicalize_split_method(rm.split_method),
             range_count=rm.range_count,
             selected_index=self.selected_index,
             selected_half=self.selected_half,
@@ -1248,6 +1274,7 @@ class AppSessionMixin:
             selected_layer_ids=tuple(self.layer_stack.selected_ids),
             bin_start=getattr(rm, "bin_start", None),
             min_coverage=clamp_min_coverage(getattr(rm, "min_coverage", MIN_COVERAGE)),
+            icc_path=str(self.icc_path) if self.icc_path is not None else None,
         )
 
     def _push_undo_state(self, before: EditSnapshot | None) -> None:
@@ -1329,7 +1356,8 @@ class AppSessionMixin:
         self._mute_ui = True
         try:
             self.range_count.set(snap.range_count)
-            self._set_range_by_from_method(snap.split_method)
+            method = canonicalize_split_method(snap.split_method)
+            self._set_range_by_from_method(method)
             self._set_assign_mode(getattr(snap, "assignment_mode", ASSIGN_KMEANS))
             self.preset_id = snap.preset_id
             self.texture_pct.set(round(snap.texture_strength * 100.0, 1))
@@ -1433,7 +1461,7 @@ class AppSessionMixin:
             self.range_map = build_range_map(
                 self.work_image,
                 snap.range_count,
-                snap.split_method,
+                method,
                 bin_start=getattr(snap, "bin_start", None),
                 min_coverage=clamp_min_coverage(getattr(snap, "min_coverage", MIN_COVERAGE)),
             )
@@ -1444,7 +1472,7 @@ class AppSessionMixin:
                     band.replacement_rgb = snap.replacements[i]
                     band.name = snap.names[i]
                     band.visible = snap.visibilities[i]
-            if is_color_split(snap.split_method):
+            if is_color_split(method):
                 sync_centers_from_match(self.range_map)
             if len(snap.weights) == len(self.range_map.ranges):
                 apply_weights(self.range_map, list(snap.weights))
@@ -1514,6 +1542,9 @@ class AppSessionMixin:
             match = get_preset(snap.preset_id) if snap.preset_id else None
             self.preset_choice.set(match.name if match is not None else GENERIC_LABEL)
             self._sync_preset_buttons()
+            raw_icc = getattr(snap, "icc_path", None)
+            self.icc_path = Path(raw_icc) if raw_icc else None
+            self._sync_icc_button()
         finally:
             self._mute_ui = False
             self._history_lock = False

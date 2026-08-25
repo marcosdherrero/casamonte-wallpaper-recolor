@@ -235,5 +235,5 @@ if ($env:WALLPAPER_RECOLOR_SKIP_SHORTCUTS -ne "1") {
 }
 
 Write-Host ""
-Write-Host "Install finished. Double-click WallpaperRecolor.bat (offline after this)."
+Write-Host "Install finished. Double-click Run-LocalPython.bat (offline after this)."
 Write-Host "Labels Detect/Remove stay unavailable unless you later pip-install OCR extras."

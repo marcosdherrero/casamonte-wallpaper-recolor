@@ -36,7 +36,18 @@ if TYPE_CHECKING:
     from wallpaper_recolor.ui.app import WallpaperRecolorApp
 
 class _SashSplit(tk.PanedWindow):
-    """Classic paned split so the sash is a visible gutter, with ttk-like ``sashpos``."""
+    """Classic paned split so the sash is a visible gutter, with ttk-like ``sashpos``.
+
+    ttk.Panedwindow on Windows draws a proxy sash (the panes look dragged, then
+    jump). ``opaqueresize`` keeps the panes sliding with the pointer.
+    """
+
+    def __init__(self, master=None, cnf=None, **kw) -> None:
+        kw.setdefault("opaqueresize", True)
+        if cnf:
+            super().__init__(master, cnf, **kw)
+        else:
+            super().__init__(master, **kw)
 
     def sashpos(self, index: int, newpos: int | None = None) -> int:
         """Pixel position of sash ``index``; set it when ``newpos`` is given."""
@@ -229,6 +240,9 @@ class ScrollColumn(tk.Frame):
     def _on_canvas_configure(self, event) -> None:
         if self._in_layout:
             return
+        if getattr(self.app, "_sash_live", False):
+            self._apply_scroll_geometry()
+            return
         self._sync_layout(canvas_w=event.width, canvas_h=event.height)
 
     def _yview_fraction(self) -> tuple[float, float]:
@@ -332,19 +346,21 @@ class ScrollColumn(tk.Frame):
         return "break"
 
     def _after_scroll_paint(self) -> None:
-        """Fully invalidate HWND panes after a wheel page so Windows does not smear."""
+        """Invalidate clipped HWND panes after a wheel page.
+
+        Do not ``lift()`` chrome or preview hosts here — on Windows that
+        steals the next MouseWheel away from the widget under the pointer.
+        """
         try:
             self.update_idletasks()
             self._apply_scroll_geometry()
             self._raise_docked_stack()
             self.canvas.update_idletasks()
-            self.app._raise_window_chrome()
             if self.column_name == "left":
                 for name in ("orig_zoom_host", "tex_zoom_host"):
                     host = getattr(self.app, name, None)
                     if host is not None:
                         try:
-                            host.lift()
                             host.viewport.configure(bg=host._bg)
                             host._layout(propagate=False)
                         except tk.TclError:
@@ -356,9 +372,13 @@ class ScrollColumn(tk.Frame):
     def contains_root(self, x_root: int, y_root: int) -> bool:
         """True if the pointer is over this column (ignores overlapping floaters)."""
         try:
+            if not self.winfo_viewable():
+                return False
             x, y = int(self.winfo_rootx()), int(self.winfo_rooty())
-            w, h = max(1, int(self.winfo_width())), max(1, int(self.winfo_height()))
+            w, h = int(self.winfo_width()), int(self.winfo_height())
         except tk.TclError:
+            return False
+        if w <= 0 or h <= 0:
             return False
         return x <= x_root < x + w and y <= y_root < y + h
 
@@ -472,7 +492,8 @@ class ScrollColumn(tk.Frame):
             self._apply_scroll_geometry()
             self._tag_column_widgets()
             self._raise_docked_stack()
-            self.app._schedule_raise_chrome()
+            if not getattr(self.app, "_sash_live", False):
+                self.app._schedule_raise_chrome()
         finally:
             self._in_layout = False
 

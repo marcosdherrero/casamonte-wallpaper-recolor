@@ -134,6 +134,7 @@ from wallpaper_recolor.labels.boxes import (
     display_box_to_source,
     display_xy_to_source,
     source_box_to_display,
+    source_xy_to_display,
 )
 from wallpaper_recolor.labels.detect import (
     aabb_quad,
@@ -431,7 +432,7 @@ class AppChromeMixin:
         )
 
     # ---------------------------------------------------------------------------
-    # Pointer tools: View Move (camera) vs Grab Move (crop / layer offset)
+    # Pointer tools: View Move (camera) vs Grab Move (layer offset / pan)
     # ---------------------------------------------------------------------------
     def _set_pointer_tool(self, tool: str) -> None:
         key = str(tool or TOOL_VIEW_MOVE)
@@ -475,7 +476,7 @@ class AppChromeMixin:
         return self._grab_move_on()
 
     def _grab_target_image(self):
-        """Image Grab Move offsets: selected Image, or parent of a Color range row."""
+        """Layer Grab Move offsets: selected Image/Label, or parent of a Color range row."""
         stack = getattr(self, "layer_stack", None)
         if stack is None:
             return None
@@ -486,58 +487,51 @@ class AppChromeMixin:
         return img if img is not None else stack.base_layer()
 
     def _grab_moves_layer(self, host=None) -> bool:
-        """Grab Move repositions the selected image in the output frame."""
+        """Grab Move repositions a non-base Image or Label. Base pans the camera."""
         if not self._grab_move_on():
             return False
         if self._label_mark_mode or self._label_place_mode:
             return False
-        return self._grab_target_image() is not None
+        target = self._grab_target_image()
+        if target is None:
+            return False
+        if target.is_label():
+            return True
+        return bool(target.is_image() and not target.is_base())
 
     def _nudge_grab_move(self, dx: int, dy: int, *, host=None) -> None:
-        """Drag in Composite: crop X/Y for the base image; layer x/y for overlays."""
+        """Drag on Composite: overlay / label x/y. Base pan is handled by the host."""
         target = self._grab_target_image()
-        if target is None or self._orig_pil is None:
+        if target is None or target.is_base():
             return
-        if self._layer_drag_before is None:
-            self._layer_drag_before = self._capture_edit()
-        photo_w, photo_h = 1, 1
-        if host is not None and host._photo is not None:
-            try:
-                photo_w = max(1, int(host._photo.width()))
-                photo_h = max(1, int(host._photo.height()))
-            except (tk.TclError, TypeError, ValueError):
-                photo_w, photo_h = self._orig_pil.size
-        else:
-            photo_w, photo_h = self._orig_pil.size
-        sw, sh = self._crop_src_size()
-        src_dx = float(dx) * float(max(1, sw)) / float(max(1, photo_w))
-        src_dy = float(dy) * float(max(1, sh)) / float(max(1, photo_h))
-        if target.is_base() or (target.is_image() and target.is_base()):
-            cx, cy, cz = self._crop_xy_zoom()
-            self._set_crop_xy_zoom(cx + src_dx, cy + src_dy, cz)
-            self._sync_slider_resets()
-            self._schedule_preview()
-            return
-        self._nudge_selected_layer(dx, dy, host=host)
+        self._nudge_layer_offset(target, dx, dy, host=host)
 
     def _nudge_selected_layer(self, dx: int, dy: int, *, host=None) -> None:
-        ly = self.layer_stack.primary()
-        if ly is None or self._orig_pil is None:
+        target = self._grab_target_image()
+        if target is None or target.is_base():
+            return
+        self._nudge_layer_offset(target, dx, dy, host=host)
+
+    def _nudge_layer_offset(self, ly, dx: int, dy: int, *, host=None) -> None:
+        if ly is None:
+            return
+        src = self._orig_pil if self._orig_pil is not None else self.work_image
+        if src is None:
             return
         if self._layer_drag_before is None:
             self._layer_drag_before = self._capture_edit()
         photo_w = 1
-        if host is not None and host._photo is not None:
+        if host is not None and getattr(host, "_photo", None) is not None:
             try:
                 photo_w = max(1, int(host._photo.width()))
             except (tk.TclError, TypeError, ValueError):
-                photo_w = max(1, self._orig_pil.size[0])
+                photo_w = max(1, src.size[0])
         else:
-            photo_w = max(1, self._orig_pil.size[0])
-        iw = max(1, self._orig_pil.size[0])
+            photo_w = max(1, src.size[0])
+        iw = max(1, src.size[0])
         cx, cy, cz = self._crop_xy_zoom()
         _dx, _dy, sc = source_xy_to_display(
-            0, 0, self._orig_pil.size, self._crop_src_size(), cx, cy, cz
+            0, 0, src.size, self._crop_src_size(), cx, cy, cz
         )
         view_sc = photo_w / float(iw)
         step = max(sc * view_sc, 1e-6)
@@ -545,7 +539,7 @@ class AppChromeMixin:
         ly.y = int(round(ly.y + float(dy) / step))
         if ly.is_label():
             self._sync_label_fields_from_layer(ly)
-        self._refresh_now()
+        self._refresh_previews()
 
     def _finish_layer_drag(self) -> None:
         before = self._layer_drag_before
@@ -588,10 +582,10 @@ class AppChromeMixin:
         self._set_pointer_tool(POINTER_TOOL_BY_LABEL.get(label, TOOL_VIEW_MOVE))
 
     # ---------------------------------------------------------------------------
-    # Close: Yes/No/Cancel save .wpedit (Cancel or failed save stays open)
+    # Close: Yes/No/Cancel save .wpedit when dirty (Cancel or failed save stays open)
     # ---------------------------------------------------------------------------
     def _on_app_close(self) -> None:
-        """Ask to save Edit state, then dock floaters and destroy the window."""
+        """Ask to save Edit state when dirty, then dock floaters and destroy."""
         if getattr(self, "_closing", False):
             return
         if self._busy:
@@ -601,16 +595,17 @@ class AppChromeMixin:
                 parent=self.root,
             )
             return
-        answer = messagebox.askyesnocancel(
-            "Save Edit state?",
-            "Save the current Wallpaper Edit state before closing?",
-            parent=self.root,
-        )
-        if answer is None:
-            return
-        if answer:
-            if not self.save_edit_state(path=self._edit_state_path):
+        if self._edit_state_is_dirty():
+            answer = messagebox.askyesnocancel(
+                "Save Edit state?",
+                "Save the current Wallpaper Edit state before closing?",
+                parent=self.root,
+            )
+            if answer is None:
                 return
+            if answer:
+                if not self.save_edit_state(path=self._edit_state_path):
+                    return
         self._destroy_app_window()
 
     def _destroy_app_window(self) -> None:

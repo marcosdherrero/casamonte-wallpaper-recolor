@@ -12,7 +12,7 @@ If Windows blocks the script, use “More info → Run anyway”, or right-click
 
 ## Run
 
-Double-click **WallpaperRecolor.bat** (or the Desktop / Start Menu “Wallpaper Recolor” shortcut Install creates).
+Double-click **Run-LocalPython.bat** (or the Desktop / Start Menu “Wallpaper Recolor” shortcut Install creates).
 
 1. File → Open a TIF / PNG / JPEG. Samples are in `examples\`.
 2. Click **Fit** so the whole wallpaper sits in Composite.

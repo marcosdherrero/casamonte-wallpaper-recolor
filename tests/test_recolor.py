@@ -39,6 +39,7 @@ from wallpaper_recolor.color.color_ranges import (
     RANGE_BY_COLOR_LABEL,
     RANGE_BY_LAB_A_LABEL,
     RANGE_BY_LAB_B_LABEL,
+    RANGE_BY_LAB_C_LABEL,
     RANGE_BY_LAB_L_LABEL,
     RANGE_BY_LUMA_LABEL,
     SPLIT_COLOR_CLOSENESS,
@@ -48,9 +49,12 @@ from wallpaper_recolor.color.color_ranges import (
     SPLIT_EQUAL_PIXELS_LABEL,
     SPLIT_LAB_A_EQUAL,
     SPLIT_LAB_A_PIXELS,
+    SPLIT_LAB_C_EQUAL,
+    SPLIT_LAB_C_PIXELS,
     SPLIT_LAB_L_EQUAL,
     SPLIT_LAB_L_PIXELS,
     build_range_map,
+    canonicalize_split_method,
     drop_color_range,
     insert_color_range,
     is_color_split,
@@ -501,7 +505,7 @@ class TestTessellate(unittest.TestCase):
         via_pipeline = apply_crop_lighting_tessellate(
             im, 0, 0, 1.0, "off", "off", False, normalize_lighting=True
         )
-        np.testing.assert_array_equal(np.asarray(via_pipeline), rgb)
+        np.testing.assert_array_equal(np.asarray(via_pipeline), np.asarray(flat))
         wrapped_only = apply_tessellate(im, "off", "off", True)
         self.assertIs(wrapped_only, im)
         self.assertFalse(np.array_equal(np.asarray(flat), rgb))
@@ -611,6 +615,223 @@ class TestTessellate(unittest.TestCase):
         self.assertLess(seam, 4.0)
         self.assertFalse(np.array_equal(out, cropped))
 
+    def test_leftover_fill_does_not_stretch_left_column(self) -> None:
+        """Left leftover is a motif wrap, not a 1-column smear of linen grain."""
+        from unittest.mock import patch
+
+        from wallpaper_recolor.transform.tessellate import (
+            MODE_TILE,
+            _copy_fill_leftover,
+            _fit_frame_by_wrap,
+            _pin_wrap_edges,
+            apply_tessellate,
+        )
+
+        h, w, leftover = 48, 72, 8
+        yy, xx = np.mgrid[0:h, 0:w]
+        grain = (110 + 50 * np.sin(yy * 0.7)).astype(np.float32)
+        rgb = np.stack((grain, grain * 0.9, grain * 0.75), axis=-1)
+        rgb[:, :, 1] = np.clip(rgb[:, :, 1] + xx * 1.8, 0, 255)
+        rgb = rgb.astype(np.uint8)
+        filled = _copy_fill_leftover(rgb, leftover, w - leftover, 0, h, True, False)
+        smeared = np.repeat(rgb[:, leftover : leftover + 1], leftover, axis=1)
+        mae = float(
+            np.mean(
+                np.abs(filled[:, :leftover].astype(np.float32) - smeared.astype(np.float32))
+            )
+        )
+        self.assertGreater(mae, 6.0)
+        xs = np.arange(leftover, dtype=np.int64)
+        src = leftover + np.mod(xs - leftover, w - leftover)
+        np.testing.assert_array_equal(filled[:, :leftover], rgb[:, src])
+        np.testing.assert_array_equal(filled[:, leftover:], rgb[:, leftover:])
+
+        core = rgb[:, leftover:]
+        restored = _fit_frame_by_wrap(core, h, w, "right", "off")
+        self.assertEqual(restored.shape, rgb.shape)
+        mae_r = float(
+            np.mean(
+                np.abs(
+                    restored[:, :leftover].astype(np.float32) - smeared.astype(np.float32)
+                )
+            )
+        )
+        self.assertGreater(mae_r, 6.0)
+
+        pinned = _pin_wrap_edges(np.array(rgb, copy=True), "left", "off")
+        np.testing.assert_array_equal(pinned[:, 1:-1], rgb[:, 1:-1])
+
+        im = Image.fromarray(rgb, mode="RGB")
+        off = apply_tessellate(im, "off", "off", True, mode=MODE_TILE)
+        self.assertIs(off, im)
+        with patch(
+            "wallpaper_recolor.transform.tessellate.tessellate_array",
+            return_value=core,
+        ):
+            out = np.asarray(apply_tessellate(im, "right", "off", True, mode=MODE_TILE))
+        self.assertEqual(out.shape, rgb.shape)
+        mae_out = float(
+            np.mean(
+                np.abs(out[:, :leftover].astype(np.float32) - smeared.astype(np.float32))
+            )
+        )
+        self.assertGreater(mae_out, 6.0)
+        apply_src = inspect.getsource(apply_tessellate)
+        self.assertIn("_fit_frame_by_wrap", apply_src)
+        self.assertNotIn("Image.Resampling.BILINEAR", apply_src)
+
+    def test_tile_build_keeps_horizontal_off(self) -> None:
+        """Tile Build must not force wrap from Left when Horizontal is Off."""
+        import tkinter as tk
+
+        import wallpaper_recolor.ui.app as ui_mod
+
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            app = ui_mod.WallpaperRecolorApp(root)
+            im = Image.fromarray(np.zeros((8, 8, 3), dtype=np.uint8), mode="RGB")
+            app.work_image = im
+            app.source_image = im
+            app.rebuild_ranges()
+            app._clear_history()
+            app.tess_mode.set("tile")
+            app._sync_tess_mode_combo()
+            app.tess_h.set("off")
+            app.tess_v.set("off")
+            app._tess_committed = ("off", "off", False, "tile")
+            app._on_tess_build()
+            _drain_busy(app, root)
+            self.assertEqual(app.tess_h.get(), "off")
+            self.assertEqual(app.tess_v.get(), "off")
+            self.assertTrue(bool(app.tess_built.get()))
+            build_src = inspect.getsource(ui_mod.WallpaperRecolorApp._on_tess_build)
+            self.assertNotIn("new_h = SIDE_LEFT", build_src)
+        finally:
+            root.destroy()
+
+    def test_wrap_seam_mask_is_plus_at_midlines(self) -> None:
+        from wallpaper_recolor.transform.inpaint import wrap_seam_mask
+
+        mask = wrap_seam_mask(64, 80, wrap_h=True, wrap_v=True)
+        self.assertEqual(mask.shape, (64, 80))
+        self.assertTrue(bool(mask[32, 40]))
+        self.assertTrue(bool(mask[0, 40]))
+        self.assertTrue(bool(mask[32, 0]))
+        self.assertFalse(bool(mask[0, 0]))
+        h_only = wrap_seam_mask(64, 80, wrap_h=True, wrap_v=False)
+        self.assertTrue(bool(h_only[0, 40]))
+        self.assertFalse(bool(h_only[32, 0]))
+
+    def test_inpaint_wrap_seams_keeps_size_without_lama(self) -> None:
+        from wallpaper_recolor.transform.inpaint import inpaint_wrap_seams
+
+        rgb = np.zeros((48, 64, 3), dtype=np.uint8)
+        rgb[:, :32] = (200, 40, 40)
+        rgb[:, 32:] = (40, 40, 200)
+        out = inpaint_wrap_seams(rgb, wrap_h=True, wrap_v=False)
+        self.assertEqual(out.shape, rgb.shape)
+        off = inpaint_wrap_seams(rgb, wrap_h=False, wrap_v=False)
+        np.testing.assert_array_equal(off, rgb)
+
+    def test_tile_mode_calls_wrap_seam_inpaint(self) -> None:
+        """Non-periodic Tile Build runs LaMa/period seam fill; exact tiles skip it."""
+        from unittest.mock import patch
+
+        from wallpaper_recolor.transform.tessellate import MODE_TILE, apply_tessellate
+
+        period, radius = 16, 3
+        full_h, full_w = 64, 64
+        yy, xx = np.mgrid[0:full_h, 0:full_w]
+        rgb = np.full((full_h, full_w, 3), 36, dtype=np.uint8)
+        for y0 in range(period // 2, full_h, period):
+            for x0 in range(period // 2, full_w, period):
+                mask = (yy - y0) ** 2 + (xx - x0) ** 2 <= radius ** 2
+                rgb[mask] = (230, 220, 210)
+        cropped = rgb[3:61, 5:60]
+        im = Image.fromarray(cropped, mode="RGB")
+        with patch(
+            "wallpaper_recolor.transform.inpaint.inpaint_wrap_seams",
+            side_effect=lambda arr, **_k: np.array(arr, copy=True),
+        ) as mocked:
+            out = apply_tessellate(im, "left", "top", True, mode=MODE_TILE)
+        self.assertTrue(mocked.called)
+        self.assertEqual(np.asarray(out).shape, cropped.shape)
+
+        tiled = np.tile(rgb[:16, :16], (4, 4, 1))
+        ident = Image.fromarray(tiled, mode="RGB")
+        with patch(
+            "wallpaper_recolor.transform.inpaint.inpaint_wrap_seams",
+            side_effect=lambda arr, **_k: np.array(arr, copy=True),
+        ) as mocked_id:
+            apply_tessellate(ident, "left", "top", True, mode=MODE_TILE)
+        self.assertFalse(mocked_id.called)
+
+    def test_lighting_bowl_is_not_already_periodic(self) -> None:
+        """Symmetric vignette makes opposite edges dark — that is not a tile."""
+        from wallpaper_recolor.transform.tessellate import (
+            apply_normalize_lighting,
+            apply_tessellate,
+            image_already_periodic,
+        )
+
+        period, radius = 16, 3
+        full_h, full_w = 64, 64
+        yy, xx = np.mgrid[0:full_h, 0:full_w]
+        rgb = np.full((full_h, full_w, 3), 90, dtype=np.uint8)
+        for y0 in range(period // 2, full_h, period):
+            for x0 in range(period // 2, full_w, period):
+                mask = (yy - y0) ** 2 + (xx - x0) ** 2 <= radius ** 2
+                rgb[mask] = (230, 220, 200)
+        cy, cx = (full_h - 1) / 2.0, (full_w - 1) / 2.0
+        r = np.sqrt(((yy - cy) / max(cy, 1e-6)) ** 2 + ((xx - cx) / max(cx, 1e-6)) ** 2)
+        gain = np.clip(1.0 - 0.55 * np.clip(r, 0.0, 1.3), 0.35, 1.0)
+        rgb = np.clip(rgb.astype(np.float32) * gain[..., None], 0, 255).astype(np.uint8)
+        cropped = rgb[3:61, 5:60]
+        self.assertFalse(image_already_periodic(cropped, "left", "top"))
+        im = Image.fromarray(cropped, mode="RGB")
+        out = np.asarray(
+            apply_tessellate(apply_normalize_lighting(im), "left", "top", True)
+        )
+        self.assertEqual(out.shape, cropped.shape)
+        np.testing.assert_allclose(
+            out[:, 0].astype(np.float32), out[:, -1].astype(np.float32), atol=4.0
+        )
+        np.testing.assert_allclose(
+            out[0].astype(np.float32), out[-1].astype(np.float32), atol=4.0
+        )
+        src_y = cropped[:, :, 1].astype(np.float32)
+        dst_y = out[:, :, 1].astype(np.float32)
+        h, w = int(dst_y.shape[0]), int(dst_y.shape[1])
+        bw = 4
+        src_center = float(
+            np.mean(src_y[h // 2 - bw : h // 2 + bw, w // 2 - bw : w // 2 + bw])
+        )
+        dst_center = float(
+            np.mean(dst_y[h // 2 - bw : h // 2 + bw, w // 2 - bw : w // 2 + bw])
+        )
+        src_corners = float(
+            np.mean(
+                (
+                    np.mean(src_y[:bw, :bw]),
+                    np.mean(src_y[:bw, -bw:]),
+                    np.mean(src_y[-bw:, :bw]),
+                    np.mean(src_y[-bw:, -bw:]),
+                )
+            )
+        )
+        dst_corners = float(
+            np.mean(
+                (
+                    np.mean(dst_y[:bw, :bw]),
+                    np.mean(dst_y[:bw, -bw:]),
+                    np.mean(dst_y[-bw:, :bw]),
+                    np.mean(dst_y[-bw:, -bw:]),
+                )
+            )
+        )
+        self.assertLess(abs(dst_center - dst_corners), abs(src_center - src_corners))
+
 
 class TestColorCloseness(unittest.TestCase):
     """Lab k-means vs snap-to-palette; match-from / change-to stay on insert."""
@@ -627,21 +848,32 @@ class TestColorCloseness(unittest.TestCase):
             [
                 RANGE_BY_COLOR_LABEL,
                 RANGE_BY_LUMA_LABEL,
-                RANGE_BY_LAB_L_LABEL,
                 RANGE_BY_LAB_A_LABEL,
                 RANGE_BY_LAB_B_LABEL,
+                RANGE_BY_LAB_C_LABEL,
             ],
         )
+        self.assertNotIn(RANGE_BY_LAB_L_LABEL, ui.RANGE_BY_LABELS)
+        self.assertNotIn("L split", ui.RANGE_BY_LABELS)
+        self.assertEqual(RANGE_BY_LAB_A_LABEL, "a* (green–red)")
+        self.assertEqual(RANGE_BY_LAB_B_LABEL, "b* (blue–yellow)")
+        self.assertEqual(RANGE_BY_LAB_C_LABEL, "C* (chroma)")
         self.assertEqual(list(ui.ASSIGN_LABELS), [ASSIGN_KMEANS_LABEL, ASSIGN_PALETTE_LABEL])
         self.assertEqual(ui.LUMA_SPLIT_LABELS[ui.SPLIT_EQUAL_PIXELS_LABEL], SPLIT_EQUAL_PIXELS)
         self.assertEqual(range_by_label_for(SPLIT_COLOR_CLOSENESS), RANGE_BY_COLOR_LABEL)
         self.assertEqual(range_by_label_for(SPLIT_EQUAL_PIXELS), RANGE_BY_LUMA_LABEL)
         self.assertEqual(range_by_label_for(SPLIT_EQUAL_LIGHTNESS), RANGE_BY_LUMA_LABEL)
-        self.assertEqual(range_by_label_for(SPLIT_LAB_L_EQUAL), RANGE_BY_LAB_L_LABEL)
+        self.assertEqual(range_by_label_for(SPLIT_LAB_L_EQUAL), RANGE_BY_LUMA_LABEL)
+        self.assertEqual(range_by_label_for("l_split"), RANGE_BY_LUMA_LABEL)
+        self.assertEqual(range_by_label_for("L"), RANGE_BY_LUMA_LABEL)
         self.assertEqual(range_by_label_for(SPLIT_LAB_A_EQUAL), RANGE_BY_LAB_A_LABEL)
+        self.assertEqual(range_by_label_for(SPLIT_LAB_C_EQUAL), RANGE_BY_LAB_C_LABEL)
+        self.assertEqual(canonicalize_split_method("l_split"), SPLIT_EQUAL_LIGHTNESS)
+        self.assertEqual(canonicalize_split_method(SPLIT_LAB_L_PIXELS), SPLIT_EQUAL_PIXELS)
+        self.assertEqual(canonicalize_split_method(SPLIT_EQUAL_PIXELS), SPLIT_EQUAL_PIXELS)
 
     def test_range_by_dropdown_rebuilds_split_method(self) -> None:
-        """Range by: Color closeness → Lab clusters; luma / L* / a* / b* → bins."""
+        """Range by: Color closeness → Lab clusters; luma / a* / b* → bins."""
         import tkinter as tk
 
         import wallpaper_recolor.ui.app as ui_mod
@@ -657,7 +889,11 @@ class TestColorCloseness(unittest.TestCase):
 
         try:
             app = ui_mod.WallpaperRecolorApp(root)
-            self.assertEqual(list(app.range_by_combo.cget("values")), list(ui_mod.RANGE_BY_LABELS))
+            values = list(app.range_by_combo.cget("values"))
+            self.assertEqual(values, list(ui_mod.RANGE_BY_LABELS))
+            self.assertNotIn("L split", values)
+            self.assertNotIn(RANGE_BY_LAB_L_LABEL, values)
+            self.assertIn(RANGE_BY_LUMA_LABEL, values)
             self.assertEqual(app.range_by.get(), RANGE_BY_COLOR_LABEL)
             self.assertEqual(app.assign_label.get(), ASSIGN_KMEANS_LABEL)
             self.assertEqual(app._assign_mode(), ASSIGN_KMEANS)
@@ -674,12 +910,17 @@ class TestColorCloseness(unittest.TestCase):
                 app.range_by.set(RANGE_BY_LAB_A_LABEL)
                 app.luma_split_label.set(SPLIT_EQUAL_PIXELS_LABEL)
                 app._on_range_by()
+                app.range_by.set(RANGE_BY_LAB_C_LABEL)
+                app._on_range_by()
 
             self.assertIn(SPLIT_COLOR_CLOSENESS, methods)
             self.assertIn(SPLIT_EQUAL_PIXELS, methods)
             self.assertIn(SPLIT_EQUAL_LIGHTNESS, methods)
             self.assertIn(SPLIT_LAB_A_PIXELS, methods)
-            self.assertEqual(app._split_method(), SPLIT_LAB_A_PIXELS)
+            self.assertIn(SPLIT_LAB_C_PIXELS, methods)
+            self.assertNotIn(SPLIT_LAB_L_EQUAL, methods)
+            self.assertNotIn(SPLIT_LAB_L_PIXELS, methods)
+            self.assertEqual(app._split_method(), SPLIT_LAB_C_PIXELS)
             self.assertTrue(app.coverage.luma_mode)
             app.coverage.update_idletasks()
             self.assertTrue(app.coverage.segments.find_withtag("lumakey"))
@@ -702,6 +943,69 @@ class TestColorCloseness(unittest.TestCase):
             self.assertFalse(app.coverage.segments.find_withtag("lumakey"))
             self.assertEqual(app.cover_hint.get().strip(), "")
             self.assertIn("match from", app.coverage._match_swatch_tip().lower())
+        finally:
+            root.destroy()
+
+    def test_range_by_updates_cluster_chart_without_preview(self) -> None:
+        """Split / Range by rebuilds cluster-chart data without a later preview-only event."""
+        import tkinter as tk
+
+        import wallpaper_recolor.ui.app as ui_mod
+
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            app = ui_mod.WallpaperRecolorApp(root)
+            arr = np.zeros((16, 24, 3), dtype=np.uint8)
+            arr[:, :12] = (200, 30, 30)
+            arr[:, 12:] = (30, 180, 40)
+            work = Image.fromarray(arr, mode="RGB")
+            app.work_image = work
+            app.source_image = work
+            app.rebuild_ranges()
+            self.assertEqual(app.range_map.split_method, SPLIT_COLOR_CLOSENESS)
+            before = app.cluster_plot._cached_data
+            self.assertIsNotNone(before)
+            self.assertEqual(before.get("split_method"), SPLIT_COLOR_CLOSENESS)
+            with patch.object(app, "_refresh_previews") as preview:
+                app.range_by.set(RANGE_BY_LUMA_LABEL)
+                app._on_range_by()
+            preview.assert_called()
+            self.assertEqual(app.range_map.split_method, SPLIT_EQUAL_PIXELS)
+            self.assertEqual(app._split_method(), SPLIT_EQUAL_PIXELS)
+            data = app.cluster_plot._cached_data
+            self.assertIsNotNone(data)
+            self.assertEqual(data.get("split_method"), SPLIT_EQUAL_PIXELS)
+            self.assertTrue(data["labels"].size)
+            self.assertTrue(app.coverage.luma_mode)
+        finally:
+            root.destroy()
+
+    def test_l_split_maps_to_luma_and_is_absent_from_ui(self) -> None:
+        """Old l_split / L / L* sessions become Range by Luma; no L-split option."""
+        import tkinter as tk
+
+        import wallpaper_recolor.ui.app as ui_mod
+
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            app = ui_mod.WallpaperRecolorApp(root)
+            values = [str(v) for v in app.range_by_combo.cget("values")]
+            self.assertNotIn("L split", values)
+            self.assertNotIn(RANGE_BY_LAB_L_LABEL, values)
+            self.assertIn(RANGE_BY_LUMA_LABEL, values)
+            caption = str(app.luma_kind_caption.cget("text") or "")
+            self.assertNotEqual(caption.strip().lower(), "l split")
+            self.assertNotEqual(caption.strip().lower(), "l split:")
+            app._set_range_by_from_method("l_split")
+            self.assertEqual(app.range_by.get(), RANGE_BY_LUMA_LABEL)
+            self.assertEqual(app._split_method(), SPLIT_EQUAL_LIGHTNESS)
+            app._set_range_by_from_method(SPLIT_LAB_L_PIXELS)
+            self.assertEqual(app.range_by.get(), RANGE_BY_LUMA_LABEL)
+            self.assertEqual(app._split_method(), SPLIT_EQUAL_PIXELS)
+            app._set_range_by_from_method("L")
+            self.assertEqual(app.range_by.get(), RANGE_BY_LUMA_LABEL)
         finally:
             root.destroy()
 
@@ -931,6 +1235,84 @@ class TestRangeShift(unittest.TestCase):
             self.assertEqual(len(app.range_map.ranges), 2)
             self.assertEqual(app.range_map.ranges[0].replacement_rgb, kept[0])
             self.assertEqual(app.range_map.ranges[1].replacement_rgb, kept[1])
+        finally:
+            root.destroy()
+
+    def test_range_count_step_is_one(self) -> None:
+        """One increment/decrement moves N by 1; invalid spin text does not snap to 4."""
+        import tkinter as tk
+
+        import wallpaper_recolor.ui.app as ui_mod
+        from wallpaper_recolor.ui.constants import DEFAULT_RANGES, MIN_RANGES
+
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            app = ui_mod.WallpaperRecolorApp(root)
+            rng = np.random.default_rng(4)
+            im = Image.fromarray(rng.integers(30, 220, (20, 20, 3), dtype=np.uint8), mode="RGB")
+            app.work_image = im
+            app.source_image = im
+            app.range_count.set(2)
+            app.rebuild_ranges()
+            assert app.range_map is not None
+            self.assertEqual(len(app.range_map.ranges), 2)
+            self.assertEqual(float(app.range_spin.cget("increment")), 1.0)
+            self.assertTrue(app.range_spin.bind("<ButtonPress-1>"))
+
+            app._nudge_range_count(1)
+            self.assertEqual(int(app.range_count.get()), 3)
+            self.assertEqual(len(app.range_map.ranges), 3)
+            names = [ly.name for ly in app.layer_stack.layers if ly.is_range()]
+            self.assertEqual(names, ["Range 1", "Range 2", "Range 3"])
+
+            app._nudge_range_count(1)
+            self.assertEqual(int(app.range_count.get()), 4)
+            self.assertEqual(len(app.range_map.ranges), 4)
+            names = [ly.name for ly in app.layer_stack.layers if ly.is_range()]
+            self.assertEqual(names, ["Range 1", "Range 2", "Range 3", "Range 4"])
+
+            app._nudge_range_count(-1)
+            self.assertEqual(int(app.range_count.get()), 3)
+            self.assertEqual(len(app.range_map.ranges), 3)
+            names = [ly.name for ly in app.layer_stack.layers if ly.is_range()]
+            self.assertEqual(names, ["Range 1", "Range 2", "Range 3"])
+
+            app._nudge_range_count(0)
+            self.assertEqual(len(app.range_map.ranges), 3)
+
+            # Empty IntVar used to TclError → DEFAULT_RANGES (4), so 2→4.
+            app.range_count.set(2)
+            app._on_range_count()
+            self.assertEqual(len(app.range_map.ranges), 2)
+            app.root.tk.globalsetvar(app.range_count._name, "")
+            self.assertEqual(app._requested_count(), 2)
+            app._on_range_count()
+            self.assertEqual(len(app.range_map.ranges), 2)
+            self.assertNotEqual(DEFAULT_RANGES, 2)
+            self.assertGreaterEqual(MIN_RANGES, 1)
+
+            with patch.object(app, "_apply_auto_k", return_value=4) as auto_k:
+                app._nudge_range_count(1)
+                auto_k.assert_not_called()
+            self.assertEqual(int(app.range_count.get()), 3)
+            self.assertEqual(len(app.range_map.ranges), 3)
+
+            # Nested command (ttk::Repeat while rebuild pumps the loop) must not skip.
+            app.range_count.set(2)
+            app._on_range_count()
+            nested = {"ran": False}
+
+            def _nested_refresh() -> None:
+                if not nested["ran"]:
+                    nested["ran"] = True
+                    app.range_count.set(4)
+                    app._on_range_count()
+
+            with patch.object(app, "_refresh_now", side_effect=_nested_refresh):
+                app._nudge_range_count(1)
+            self.assertEqual(len(app.range_map.ranges), 3)
+            self.assertEqual(int(app.range_count.get()), 3)
         finally:
             root.destroy()
 
@@ -1581,7 +1963,6 @@ class TestTextureStrength(unittest.TestCase):
                     app.texture_panel,
                     app.tone_panel,
                     app.scale_panel,
-                    app.crop_panel,
                 ],
             )
             self.assertFalse(app.tess_panel.hidden)
@@ -1593,7 +1974,7 @@ class TestTextureStrength(unittest.TestCase):
             self.assertIs(app.texture_panel.column, app.right_column)
             self.assertIs(app.tone_panel.column, app.right_column)
             self.assertIs(app.scale_panel.column, app.right_column)
-            self.assertIs(app.crop_panel.column, app.right_column)
+            self.assertIs(app.crop_panel.column, app.right_bottom_column)
             self.assertEqual(len(app.body_paned.panes()), 2)
             self.assertTrue(callable(app.body_paned.sashpos))
 
@@ -1610,7 +1991,6 @@ class TestTextureStrength(unittest.TestCase):
                     app.coverage_panel,
                     app.tone_panel,
                     app.scale_panel,
-                    app.crop_panel,
                 ],
             )
             for panel in docked:
@@ -1952,6 +2332,39 @@ class TestTextureStrength(unittest.TestCase):
         self.assertEqual((bw, bh), (370, 370))
         self.assertEqual(ui_mod.letterbox_xy(bw, bh, 370, 400), (0, 15))
 
+    def test_letterbox_bg_matches_chrome_not_black(self) -> None:
+        """100% fit letterbox is ttk chrome gray, not a dark void."""
+        import tkinter as tk
+
+        import wallpaper_recolor.ui.app as ui_mod
+        from wallpaper_recolor.ui.constants import PREVIEW_PANE_BG
+
+        hex_color = PREVIEW_PANE_BG.lstrip("#")
+        self.assertEqual(len(hex_color), 6)
+        r, g, b = (int(hex_color[i : i + 2], 16) for i in (0, 2, 4))
+        self.assertGreater(r, 0xC0)
+        self.assertGreater(g, 0xC0)
+        self.assertGreater(b, 0xC0)
+        self.assertNotEqual(PREVIEW_PANE_BG.lower(), "#2a2a2a")
+        self.assertNotEqual(PREVIEW_PANE_BG.lower(), "#000000")
+
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            app = ui_mod.WallpaperRecolorApp(root)
+            pane = PREVIEW_PANE_BG.lower()
+            self.assertEqual(str(app.orig_host.cget("bg")).lower(), pane)
+            self.assertEqual(str(app.tex_host.cget("bg")).lower(), pane)
+            self.assertEqual(str(app.orig_zoom_host.cget("bg")).lower(), pane)
+            self.assertEqual(str(app.orig_zoom_host.viewport.cget("bg")).lower(), pane)
+            self.assertEqual(
+                str(app.orig_zoom_host.image_label.cget("bg")).lower(), pane
+            )
+            self.assertEqual(str(app.tex_zoom_host.cget("bg")).lower(), pane)
+            self.assertEqual(str(app.tex_zoom_host.viewport.cget("bg")).lower(), pane)
+        finally:
+            root.destroy()
+
     def test_square_preview_photos_match_in_rectangular_pane(self) -> None:
         """Square work image: Original and Result PhotoImages share W×H in a wide pane."""
         import tkinter as tk
@@ -1996,7 +2409,7 @@ class TestTextureStrength(unittest.TestCase):
             root.destroy()
 
     def test_fit_contains_full_image_and_pointer_tools(self) -> None:
-        """Fit 100% contain-scales into the dest pane; Grab Move changes crop X/Y only."""
+        """Fit 100% contain-scales into the dest pane; Grab Move offsets overlay x/y."""
         import tkinter as tk
 
         import wallpaper_recolor.ui.app as ui_mod
@@ -2044,8 +2457,86 @@ class TestTextureStrength(unittest.TestCase):
             self.assertEqual(app.pointer_tool_label.get(), "Grab Move")
             self.assertEqual(app.crop_x.get(), 0.0)
             app._nudge_grab_move(40, 10, host=app.orig_zoom_host)
-            self.assertNotEqual(int(round(app.crop_x.get())), 0)
+            self.assertEqual(int(round(app.crop_x.get())), 0)
             self.assertAlmostEqual(app.preview_zoom.get(), zoom_before)
+
+            over = app.layer_stack.add_image(
+                name="Overlay",
+                raster=Image.new("RGB", (32, 16), (220, 20, 20)),
+            )
+            app._nudge_grab_move(40, 10, host=app.tex_zoom_host)
+            self.assertNotEqual(over.x, 0)
+            self.assertEqual(int(round(app.crop_x.get())), 0)
+        finally:
+            root.destroy()
+
+    def test_grab_move_drag_repositions_overlay_and_label(self) -> None:
+        """Grab drag on Result moves the selected overlay/label; base pans when zoomed."""
+        import tkinter as tk
+
+        import wallpaper_recolor.ui.app as ui_mod
+
+        class _Ev:
+            def __init__(self, x_root: int, y_root: int) -> None:
+                self.x_root = x_root
+                self.y_root = y_root
+                self.x = 0
+                self.y = 0
+
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            app = ui_mod.WallpaperRecolorApp(root)
+            work = Image.new("RGB", (80, 40), (10, 20, 30))
+            app.work_image = work
+            app.source_image = work
+            app.rebuild_ranges()
+            app._reset_preview_zoom()
+            app._set_pointer_tool(ui_mod.TOOL_GRAB_MOVE)
+            app._refresh_previews = lambda: None  # type: ignore[method-assign]
+            host = app.tex_zoom_host
+            host.can_pan = lambda: False  # type: ignore[method-assign]
+            host._sync_host_cursor()
+            self.assertEqual(str(host.image_label.cget("cursor")), "hand2")
+            self.assertFalse(host._want_rect())
+
+            over = app.layer_stack.add_image(
+                name="Overlay",
+                raster=Image.new("RGB", (16, 8), (200, 10, 10)),
+            )
+            self.assertTrue(app._grab_moves_layer(host=host))
+            host._on_press(_Ev(100, 100))
+            self.assertIsNone(host._rect_start)
+            host._on_drag(_Ev(140, 110))
+            self.assertTrue(host.moving_layer)
+            self.assertNotEqual((over.x, over.y), (0, 0))
+            moved = (over.x, over.y)
+            host._on_release(_Ev(140, 110))
+            self.assertFalse(host.moving_layer)
+            self.assertIsNone(app._layer_drag_before)
+            self.assertEqual((over.x, over.y), moved)
+            self.assertGreaterEqual(len(app._undo_stack), 1)
+
+            label = app.layer_stack.add_label(name="Label", text="Hi", x=5, y=8)
+            host._on_press(_Ev(50, 50))
+            host._on_drag(_Ev(90, 70))
+            host._on_release(_Ev(90, 70))
+            self.assertNotEqual((label.x, label.y), (5, 8))
+
+            base = app.layer_stack.base_layer()
+            self.assertIsNotNone(base)
+            app.layer_stack.select(base.id)
+            self.assertFalse(app._grab_moves_layer(host=host))
+            crop_x = float(app.crop_x.get())
+            host.can_pan = lambda: True  # type: ignore[method-assign]
+            host._layout = lambda **_kw: None  # type: ignore[method-assign]
+            host._pan_x = 20
+            host._on_press(_Ev(100, 100))
+            host._on_drag(_Ev(130, 100))
+            self.assertTrue(host.panning)
+            self.assertEqual(host._pan_x, -10)
+            self.assertEqual(float(app.crop_x.get()), crop_x)
+            host._on_release(_Ev(130, 100))
         finally:
             root.destroy()
 
@@ -2357,6 +2848,78 @@ class TestToneAndEyes(unittest.TestCase):
         finally:
             root.destroy()
 
+    def test_match_swatch_action_sets_tone(self) -> None:
+        """Match swatch exists on Color & lighting and is undoable."""
+        import tkinter as tk
+
+        import wallpaper_recolor.ui.app as ui_mod
+        from wallpaper_recolor.color.pantone import lookup_pantone_rgb
+
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            app = ui_mod.WallpaperRecolorApp(root)
+            self.assertTrue(callable(app._on_match_swatch))
+            self.assertTrue(callable(app.open_swatch_photo))
+            self.assertTrue(_widget_under(app.match_swatch_btn, app.tone_panel))
+            self.assertTrue(_widget_under(app.swatch_photo_btn, app.tone_panel))
+            target = lookup_pantone_rgb("186 C")
+            self.assertIsNotNone(target)
+            sampled = (
+                min(255, int(target[0]) + 40),
+                max(0, int(target[1]) - 35),
+                max(0, int(target[2]) - 25),
+            )
+            red = np.full((16, 16, 3), (200, 40, 40), dtype=np.uint8)
+            im = Image.fromarray(red, mode="RGB")
+            app.work_image = im
+            app.source_image = im
+            app.rebuild_ranges()
+            app._swatch_sampled_rgb = sampled
+            app.swatch_pantone_var.set("186 C")
+            app._on_match_swatch()
+            moved = abs(app.temperature_pct.get()) + abs(app.tint_pct.get()) + abs(
+                app.exposure_pct.get()
+            )
+            self.assertGreater(moved, 1.0)
+            self.assertAlmostEqual(
+                app.range_map.tone_temperature, app.temperature_pct.get() / 100.0, places=4
+            )
+            self.assertAlmostEqual(
+                app.range_map.tone_exposure, app.exposure_pct.get() / 100.0, places=4
+            )
+            self.assertGreater(len(app._undo_stack), 0)
+            app.undo_edit()
+            self.assertAlmostEqual(app.temperature_pct.get(), 0.0)
+            self.assertAlmostEqual(app.exposure_pct.get(), 0.0)
+        finally:
+            root.destroy()
+
+    def test_load_swatch_photo_guesses_pantone(self) -> None:
+        import tkinter as tk
+
+        import wallpaper_recolor.ui.app as ui_mod
+        from wallpaper_recolor.color.swatch_match import mean_rgb_at
+
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            app = ui_mod.WallpaperRecolorApp(root)
+            with tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / "chip.png"
+                arr = np.zeros((48, 48, 3), dtype=np.uint8)
+                arr[:] = (40, 50, 60)
+                arr[12:36, 12:36] = (200, 30, 40)
+                Image.fromarray(arr, mode="RGB").save(path)
+                self.assertTrue(app._load_swatch_image(path))
+                sampled = mean_rgb_at(app._swatch_rgb, 24, 24)
+                app._apply_swatch_sample(sampled)
+            self.assertEqual(app._swatch_sampled_rgb, (200, 30, 40))
+            self.assertTrue(app.swatch_pantone_var.get())
+            self.assertIsNotNone(app._swatch_win)
+        finally:
+            root.destroy()
+
     def test_snapshot_keeps_tone_and_visibility(self) -> None:
         im = Image.fromarray(np.zeros((8, 8, 3), dtype=np.uint8), mode="RGB")
         range_map = build_range_map(im, 2, SPLIT_COLOR_CLOSENESS)
@@ -2420,7 +2983,6 @@ class TestToneAndEyes(unittest.TestCase):
         import tkinter as tk
 
         import wallpaper_recolor.ui.app as ui_mod
-        from wallpaper_recolor.color.layers import live_composite_from_map
 
         root = tk.Tk()
         root.withdraw()
@@ -2440,16 +3002,18 @@ class TestToneAndEyes(unittest.TestCase):
             title_before = app.orig_title.get()
             app._on_tess_normalize()
             self.assertTrue(bool(app.tess_normalize.get()))
-            self.assertGreater(abs(app.darks_pct.get()) + abs(app.lights_pct.get()), 2.0)
             orig_after = np.asarray(app._orig_pil.convert("RGB"))
             live_after = np.asarray(app._work_live.convert("RGB"))
             np.testing.assert_array_equal(orig_after, orig_before)
             self.assertFalse(np.array_equal(live_after, live_before))
             self.assertFalse(np.array_equal(orig_after, live_after))
             self.assertEqual(app.orig_title.get(), title_before)
-            assert app.range_map is not None
-            saved = np.asarray(live_composite_from_map(app.range_map).convert("RGB"))
-            self.assertFalse(np.array_equal(saved, rgb))
+            live_y = live_after[:, :, 1].astype(np.float32)
+            src_y = rgb[:, :, 1].astype(np.float32)
+            bw = 4
+            src_gap = abs(float(np.mean(src_y[:, :bw])) - float(np.mean(src_y[:, -bw:])))
+            dst_gap = abs(float(np.mean(live_y[:, :bw])) - float(np.mean(live_y[:, -bw:])))
+            self.assertLess(dst_gap, src_gap)
         finally:
             root.destroy()
 
@@ -2620,6 +3184,20 @@ class TestToneAndEyes(unittest.TestCase):
         self.assertEqual(kmeans.split_method, SPLIT_COLOR_CLOSENESS)
         self.assertIsNotNone(kmeans.centers)
 
+    def test_lab_c_split_separates_gray_from_chroma(self) -> None:
+        """C* = hypot(a*, b*) bins gray (low chroma) away from saturated red."""
+        arr = np.zeros((8, 16, 3), dtype=np.uint8)
+        arr[:, :8] = (128, 128, 128)
+        arr[:, 8:] = (220, 30, 30)
+        im = Image.fromarray(arr, mode="RGB")
+        range_map = build_range_map(im, 2, SPLIT_LAB_C_EQUAL)
+        self.assertEqual(range_map.split_method, SPLIT_LAB_C_EQUAL)
+        assert range_map.labels is not None
+        self.assertNotEqual(int(range_map.labels[0, 2]), int(range_map.labels[0, 12]))
+        from wallpaper_recolor.color.presets import range_by_label_for
+
+        self.assertEqual(range_by_label_for(SPLIT_LAB_C_EQUAL), RANGE_BY_LAB_C_LABEL)
+
     def test_lab_l_split_differs_from_rec709_luma(self) -> None:
         arr = np.zeros((8, 16, 3), dtype=np.uint8)
         arr[:, :8] = (255, 0, 0)
@@ -2755,7 +3333,6 @@ class TestLayoutHistory(unittest.TestCase):
                     app.texture_panel,
                     app.tone_panel,
                     app.scale_panel,
-                    app.crop_panel,
                 ],
             )
             self.assertIs(app.wheel_panel.column, app.right_column)
@@ -2763,7 +3340,7 @@ class TestLayoutHistory(unittest.TestCase):
             self.assertIn(app.coverage_panel, app.left_column.panels)
             self.assertIn(app.tone_panel, app.right_column.panels)
             self.assertIn(app.scale_panel, app.right_column.panels)
-            self.assertIn(app.crop_panel, app.right_column.panels)
+            self.assertIn(app.crop_panel, app.right_bottom_column.panels)
             self.assertTrue(app.tess_panel.expanded)
             self.assertTrue(app.layers_panel.expanded)
             self.assertTrue(app.labels_panel.expanded)
@@ -2949,6 +3526,8 @@ class TestLayoutHistory(unittest.TestCase):
             app._on_tess_build()
             _drain_busy(app, root)
             self.assertTrue(bool(app.tess_built.get()))
+            self.assertEqual(app.tess_h.get(), "left")
+            self.assertEqual(app.tess_v.get(), "off")
             self.assertTrue(app._capture_edit().tess_built)
             self.assertEqual(str(app.tess_build_reset.winfo_manager()), "pack")
             app._reset_tess_h()
@@ -2962,8 +3541,8 @@ class TestLayoutHistory(unittest.TestCase):
             self.assertFalse(bool(app.tess_built.get()))
             app._on_tess_build()
             _drain_busy(app, root)
-            self.assertEqual(app.tess_h.get(), "left")
-            self.assertEqual(app.tess_v.get(), "top")
+            self.assertEqual(app.tess_h.get(), "off")
+            self.assertEqual(app.tess_v.get(), "off")
             self.assertTrue(bool(app.tess_built.get()))
             self.assertTrue(bool(app.tess_normalize.get()))
             app._reset_tess_normalize()
@@ -2987,11 +3566,12 @@ class TestLayoutHistory(unittest.TestCase):
             app.saturation_pct.set(-10.0)
             app._sync_tone_to_map()
             app._on_tess_normalize()
-            self.assertGreater(abs(app.darks_pct.get()) + abs(app.lights_pct.get()), 2.0)
+            self.assertAlmostEqual(app.darks_pct.get(), 0.0, delta=0.51)
+            self.assertAlmostEqual(app.lights_pct.get(), 0.0, delta=0.51)
             self.assertTrue(bool(app.tess_normalize.get()))
             snap_lit = app._capture_edit()
             self.assertTrue(snap_lit.tess_normalize)
-            self.assertAlmostEqual(snap_lit.tone_darks, app.darks_pct.get() / 100.0, places=4)
+            self.assertAlmostEqual(snap_lit.tone_darks, 0.0, places=4)
             self.assertAlmostEqual(snap_lit.tone_lights_reds, 0.0, places=4)
             self.assertAlmostEqual(snap_lit.tone_balance_cyan, 0.3, places=4)
             self.assertAlmostEqual(snap_lit.tone_lights_cyan, 0.3, places=4)
@@ -3006,27 +3586,21 @@ class TestLayoutHistory(unittest.TestCase):
             self.assertAlmostEqual(app.contrast_pct.get(), 0.0)
             self.assertAlmostEqual(app.exposure_pct.get(), 0.0)
             self.assertAlmostEqual(app.brightness_pct.get(), 0.0)
-            first_d = float(app.darks_pct.get())
-            first_l = float(app.lights_pct.get())
-            app._on_tess_normalize()
-            self.assertAlmostEqual(app.darks_pct.get(), first_d, delta=0.51)
-            self.assertAlmostEqual(app.lights_pct.get(), first_l, delta=0.51)
             app.darks_pct.set(80.0)
             app._on_tess_normalize()
-            self.assertAlmostEqual(app.darks_pct.get(), first_d, delta=0.51)
-            self.assertAlmostEqual(app.lights_pct.get(), first_l, delta=0.51)
+            self.assertAlmostEqual(app.darks_pct.get(), 80.0, delta=0.51)
+            self.assertTrue(bool(app.tess_normalize.get()))
             app._reset_tess_normalize()
             self.assertFalse(bool(app.tess_normalize.get()))
-            self.assertAlmostEqual(app.darks_pct.get(), 0.0, delta=1.0)
-            self.assertAlmostEqual(app.lights_pct.get(), 0.0, delta=1.0)
+            self.assertAlmostEqual(app.darks_pct.get(), 80.0, delta=0.51)
+            self.assertAlmostEqual(app.lights_pct.get(), 0.0, delta=0.51)
             app._on_tess_normalize()
             self.assertTrue(bool(app.tess_normalize.get()))
-            self.assertGreater(abs(app.darks_pct.get()) + abs(app.lights_pct.get()), 2.0)
             app.darks_pct.set(0.0)
             app.lights_pct.set(0.0)
             app._on_tone_slider("")
-            self.assertFalse(bool(app.tess_normalize.get()))
-            self.assertEqual(str(app.tess_normalize_reset.winfo_manager()), "")
+            self.assertTrue(bool(app.tess_normalize.get()))
+            self.assertEqual(str(app.tess_normalize_reset.winfo_manager()), "pack")
             app.balance_cyan_pct.set(0.0)
             app.temperature_pct.set(0.0)
             app.saturation_pct.set(0.0)
@@ -3043,7 +3617,7 @@ class TestLayoutHistory(unittest.TestCase):
             app._clear_history()
             from wallpaper_recolor.transform.tessellate import plan_tessellate_crop
 
-            planned = plan_tessellate_crop(split, "left", "off")
+            planned = plan_tessellate_crop(split, "left", "top")
             app.tess_h.set("left")
             app._tess_committed = ("off", "off", False, "tile")
             app._on_tess_side()
@@ -3176,13 +3750,13 @@ class TestLayoutHistory(unittest.TestCase):
                     app.texture_panel,
                     app.tone_panel,
                     app.scale_panel,
-                    app.crop_panel,
                 ],
             )
             self.assertEqual(
                 app.right_bottom_column.panels,
                 [
                     app.layers_panel,
+                    app.crop_panel,
                     app.labels_panel,
                     app.tess_panel,
                     app.history_panel,
@@ -3278,6 +3852,34 @@ class TestLayoutHistory(unittest.TestCase):
         finally:
             root.destroy()
 
+    def test_sash_slides_without_preview_refit_until_release(self) -> None:
+        """Main split uses an opaque sash; preview PhotoImage waits until mouse up."""
+        import tkinter as tk
+
+        import wallpaper_recolor.ui.app as ui_mod
+        from wallpaper_recolor.ui.dock import _SashSplit
+
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            app = ui_mod.WallpaperRecolorApp(root)
+            self.assertIsInstance(app.body_paned, _SashSplit)
+            self.assertIsInstance(app.right_host, _SashSplit)
+            self.assertIn(str(app.body_paned.cget("opaqueresize")).lower(), ("1", "true"))
+            self.assertIn(str(app.right_host.cget("opaqueresize")).lower(), ("1", "true"))
+            fits: list[int] = []
+            app._schedule_preview_fit = lambda: fits.append(1)  # type: ignore[method-assign]
+            app._sash_live = True
+            class _Ev:
+                widget = app.orig_zoom_host
+            app._on_preview_fit_configure(_Ev())
+            self.assertEqual(fits, [])
+            app._on_sash_release()
+            self.assertEqual(fits, [1])
+            self.assertFalse(app._sash_live)
+        finally:
+            root.destroy()
+
     def test_preview_opens_on_composite_tab(self) -> None:
         """Preview notebook starts on Composite, not Clusters."""
         import tkinter as tk
@@ -3294,8 +3896,56 @@ class TestLayoutHistory(unittest.TestCase):
         finally:
             root.destroy()
 
+    def test_preview_selected_tab_style_contrasts_idle(self) -> None:
+        """Selected preview tab style map differs from idle; still distinct unfocused."""
+        import tkinter as tk
+        from tkinter import ttk
+
+        import wallpaper_recolor.ui.app as ui_mod
+        from wallpaper_recolor.ui.constants import (
+            PREVIEW_NOTEBOOK_STYLE,
+            PREVIEW_PANE_BG,
+            PREVIEW_TAB_IDLE_BG,
+            PREVIEW_TAB_IDLE_FG,
+            PREVIEW_TAB_SELECTED_BG,
+            PREVIEW_TAB_SELECTED_FG,
+        )
+
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            app = ui_mod.WallpaperRecolorApp(root)
+            self.assertEqual(str(app.notebook.cget("style")), PREVIEW_NOTEBOOK_STYLE)
+            style = ttk.Style()
+            tab = f"{PREVIEW_NOTEBOOK_STYLE}.Tab"
+            selected_bg = str(style.lookup(tab, "background", ("selected",)) or "")
+            idle_bg = str(style.lookup(tab, "background", ("!selected",)) or "")
+            selected_fg = str(style.lookup(tab, "foreground", ("selected",)) or "")
+            idle_fg = str(style.lookup(tab, "foreground", ("!selected",)) or "")
+            self.assertEqual(selected_bg.lower(), PREVIEW_TAB_SELECTED_BG.lower())
+            self.assertEqual(idle_bg.lower(), PREVIEW_TAB_IDLE_BG.lower())
+            self.assertEqual(selected_fg.lower(), PREVIEW_TAB_SELECTED_FG.lower())
+            self.assertEqual(idle_fg.lower(), PREVIEW_TAB_IDLE_FG.lower())
+            self.assertNotEqual(selected_bg.lower(), idle_bg.lower())
+            self.assertNotEqual(selected_fg.lower(), idle_fg.lower())
+            unfocused_bg = str(
+                style.lookup(tab, "background", ("selected", "!focus")) or ""
+            )
+            unfocused_fg = str(
+                style.lookup(tab, "foreground", ("selected", "!focus")) or ""
+            )
+            self.assertEqual(unfocused_bg.lower(), selected_bg.lower())
+            self.assertEqual(unfocused_fg.lower(), selected_fg.lower())
+            self.assertTrue(style.map(tab, "background"))
+            self.assertTrue(style.map(tab, "foreground"))
+            nb_bg = str(style.lookup(PREVIEW_NOTEBOOK_STYLE, "background") or "")
+            self.assertEqual(nb_bg.lower(), PREVIEW_PANE_BG.lower())
+            self.assertNotEqual(PREVIEW_PANE_BG.lower(), "#000000")
+        finally:
+            root.destroy()
+
     def test_close_asks_save_edit_state(self) -> None:
-        """WM_DELETE_WINDOW / Exit ask Yes-No-Cancel before destroy."""
+        """WM_DELETE_WINDOW / Exit ask Yes-No-Cancel before destroy when dirty."""
         import tkinter as tk
         from unittest.mock import patch
 
@@ -3310,23 +3960,95 @@ class TestLayoutHistory(unittest.TestCase):
                 handler.endswith("_on_app_close"),
                 f"WM_DELETE_WINDOW is {handler!r}",
             )
+            with tempfile.TemporaryDirectory() as tmp:
+                img_path = Path(tmp) / "tiny.png"
+                Image.fromarray(np.zeros((8, 8, 3), dtype=np.uint8), mode="RGB").save(img_path)
+                self.assertTrue(app._open_image_from_path(img_path, reset_edits=True))
+                self.assertTrue(app._edit_state_is_dirty())
+                with patch.object(app, "_destroy_app_window") as destroy:
+                    with patch.object(ui_mod.messagebox, "askyesnocancel", return_value=None):
+                        app._on_app_close()
+                    destroy.assert_not_called()
+                    with patch.object(ui_mod.messagebox, "askyesnocancel", return_value=False):
+                        app._on_app_close()
+                    destroy.assert_called_once()
+                    destroy.reset_mock()
+                    with patch.object(ui_mod.messagebox, "askyesnocancel", return_value=True):
+                        with patch.object(app, "save_edit_state", return_value=False) as save:
+                            app._on_app_close()
+                            save.assert_called_once()
+                    destroy.assert_not_called()
+                    with patch.object(ui_mod.messagebox, "askyesnocancel", return_value=True):
+                        with patch.object(app, "save_edit_state", return_value=True):
+                            app._on_app_close()
+                    destroy.assert_called_once()
+        finally:
+            try:
+                root.destroy()
+            except tk.TclError:
+                pass
+
+    def test_close_skips_save_prompt_when_clean(self) -> None:
+        """Empty app and a just-saved session close without a save dialog."""
+        import tkinter as tk
+        from unittest.mock import patch
+
+        import wallpaper_recolor.ui.app as ui_mod
+
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            app = ui_mod.WallpaperRecolorApp(root)
             with patch.object(app, "_destroy_app_window") as destroy:
-                with patch.object(ui_mod.messagebox, "askyesnocancel", return_value=None):
+                with patch.object(ui_mod.messagebox, "askyesnocancel") as ask:
                     app._on_app_close()
-                destroy.assert_not_called()
-                with patch.object(ui_mod.messagebox, "askyesnocancel", return_value=False):
-                    app._on_app_close()
+                ask.assert_not_called()
                 destroy.assert_called_once()
-                destroy.reset_mock()
-                with patch.object(ui_mod.messagebox, "askyesnocancel", return_value=True):
-                    with patch.object(app, "save_edit_state", return_value=False) as save:
+            with tempfile.TemporaryDirectory() as tmp:
+                img_path = Path(tmp) / "tiny.png"
+                Image.fromarray(np.zeros((8, 8, 3), dtype=np.uint8), mode="RGB").save(img_path)
+                self.assertTrue(app._open_image_from_path(img_path, reset_edits=True))
+                self.assertTrue(app._edit_state_is_dirty())
+                state_path = Path(tmp) / "tiny_edit.wpedit"
+                self.assertTrue(app.save_edit_state(path=state_path))
+                self.assertFalse(app._edit_state_is_dirty())
+                with patch.object(app, "_destroy_app_window") as destroy:
+                    with patch.object(ui_mod.messagebox, "askyesnocancel") as ask:
                         app._on_app_close()
-                        save.assert_called_once()
-                destroy.assert_not_called()
-                with patch.object(ui_mod.messagebox, "askyesnocancel", return_value=True):
-                    with patch.object(app, "save_edit_state", return_value=True):
+                    ask.assert_not_called()
+                    destroy.assert_called_once()
+        finally:
+            try:
+                root.destroy()
+            except tk.TclError:
+                pass
+
+    def test_close_asks_save_after_edit(self) -> None:
+        """An edit after a successful save marks dirty and close prompts again."""
+        import tkinter as tk
+        from unittest.mock import patch
+
+        import wallpaper_recolor.ui.app as ui_mod
+
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            app = ui_mod.WallpaperRecolorApp(root)
+            with tempfile.TemporaryDirectory() as tmp:
+                img_path = Path(tmp) / "tiny.png"
+                Image.fromarray(np.zeros((8, 8, 3), dtype=np.uint8), mode="RGB").save(img_path)
+                self.assertTrue(app._open_image_from_path(img_path, reset_edits=True))
+                state_path = Path(tmp) / "tiny_edit.wpedit"
+                self.assertTrue(app.save_edit_state(path=state_path))
+                self.assertFalse(app._edit_state_is_dirty())
+                app.crop_zoom.set(2.0)
+                app._sync_crop_bounds(clamp=True)
+                self.assertTrue(app._edit_state_is_dirty())
+                with patch.object(app, "_destroy_app_window") as destroy:
+                    with patch.object(ui_mod.messagebox, "askyesnocancel", return_value=None) as ask:
                         app._on_app_close()
-                destroy.assert_called_once()
+                    ask.assert_called_once()
+                    destroy.assert_not_called()
         finally:
             try:
                 root.destroy()
@@ -3405,6 +4127,14 @@ class TestLayoutHistory(unittest.TestCase):
             self.assertAlmostEqual(m[5], r[3])
             self.assertAlmostEqual(m[5], r[5])
             self.assertGreater(m[2] - m[0], SEG_H)
+            diags = bar.segments.find_withtag("diag")
+            self.assertEqual(len(diags), 2)
+            d0 = bar.segments.coords(bar.segments.find_withtag("seg0diag")[0])
+            self.assertEqual(len(d0), 4)
+            self.assertAlmostEqual(d0[0], m[0])
+            self.assertAlmostEqual(d0[1], SEG_H)
+            self.assertAlmostEqual(d0[2], m[2])
+            self.assertAlmostEqual(d0[3], 0.0)
 
             i0, x0, x1 = bar._seg_hits[0]
             self.assertEqual(i0, 0)
@@ -3632,7 +4362,7 @@ class TestOutputScale(unittest.TestCase):
             self.assertFalse(app.scale_panel.allow_pop_out)
             self.assertIs(app.scale_panel.column, app.right_column)
             self.assertFalse(app.crop_panel.allow_pop_out)
-            self.assertIs(app.crop_panel.column, app.right_column)
+            self.assertIs(app.crop_panel.column, app.right_bottom_column)
             self.assertFalse(app.tess_panel.allow_pop_out)
             self.assertIs(app.tess_panel.column, app.right_bottom_column)
             self.assertFalse(app.labels_panel.allow_pop_out)
@@ -3813,6 +4543,110 @@ class TestOutputScale(unittest.TestCase):
             bind_src = inspect.getsource(ui_mod._bind_wheel_tree)
             self.assertIn("break", bind_src)
             app._raise_window_chrome()
+            self.assertIn("_on_pointer_hover", init_src)
+            self.assertIn("<Motion>", init_src)
+            hit_src = inspect.getsource(ui_mod.WallpaperRecolorApp._pointer_over_preview_image)
+            self.assertIn("_point_over_preview_image", hit_src)
+            self.assertIn("_pointer_over_app", hit_src)
+        finally:
+            root.destroy()
+
+    def test_pointer_hit_test_preview_sidebar_slider(self) -> None:
+        """Point → preview vs slider vs sidebar without trusting a focused widget."""
+        import wallpaper_recolor.ui.app as ui_mod
+
+        class _Box:
+            def __init__(self, x: int, y: int, w: int, h: int) -> None:
+                self._x, self._y, self._w, self._h = x, y, w, h
+
+            def winfo_rootx(self) -> int:
+                return self._x
+
+            def winfo_rooty(self) -> int:
+                return self._y
+
+            def winfo_width(self) -> int:
+                return self._w
+
+            def winfo_height(self) -> int:
+                return self._h
+
+        preview = _Box(0, 0, 400, 300)
+        slider = _Box(500, 80, 200, 24)
+        sidebar = _Box(500, 0, 280, 600)
+        self.assertTrue(ui_mod._widget_contains_root(preview, 10, 10))
+        self.assertFalse(ui_mod._widget_contains_root(preview, 520, 90))
+        self.assertEqual(
+            ui_mod.classify_pointer_hit(
+                10, 10, preview=(preview,), sliders=(slider,), sidebars=(sidebar,)
+            ),
+            ui_mod.HIT_PREVIEW,
+        )
+        self.assertEqual(
+            ui_mod.classify_pointer_hit(
+                520, 90, preview=(preview,), sliders=(slider,), sidebars=(sidebar,)
+            ),
+            ui_mod.HIT_SLIDER,
+        )
+        self.assertEqual(
+            ui_mod.classify_pointer_hit(
+                520, 200, preview=(preview,), sliders=(slider,), sidebars=(sidebar,)
+            ),
+            ui_mod.HIT_SIDEBAR,
+        )
+        self.assertEqual(
+            ui_mod.classify_pointer_hit(
+                -20, -20, preview=(preview,), sliders=(slider,), sidebars=(sidebar,)
+            ),
+            ui_mod.HIT_NONE,
+        )
+
+        import tkinter as tk
+
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            app = ui_mod.WallpaperRecolorApp(root)
+            app._pointer_over_app = lambda _x, _y: True  # type: ignore[method-assign]
+            app._point_over_preview_image = lambda _x, _y: False  # type: ignore[method-assign]
+            app._widget_is_preview_image = lambda _w: False  # type: ignore[method-assign]
+
+            class _FocusedPreview:
+                widget = app.orig_label
+                x_root = 520
+                y_root = 90
+                delta = 120
+                num = 0
+                state = 0
+
+            self.assertFalse(app._pointer_over_preview_image(_FocusedPreview()))
+
+            app._point_over_preview_image = lambda _x, _y: True  # type: ignore[method-assign]
+
+            class _FocusedSlider:
+                widget = app.texture_scale
+                x_root = 40
+                y_root = 40
+                delta = 120
+                num = 0
+                state = 0
+
+            self.assertTrue(app._pointer_over_preview_image(_FocusedSlider()))
+
+            app._pointer_over_preview_image = lambda _e: False  # type: ignore[method-assign]
+            app._pointer_over_clusters = lambda _e: False  # type: ignore[method-assign]
+            app._pointer_hit_xy = lambda _e: (520, 90)  # type: ignore[method-assign]
+            app._pointer_over_app = lambda _x, _y: True  # type: ignore[method-assign]
+            app.left_column.contains_root = lambda _x, _y: False  # type: ignore[method-assign]
+            app.right_column.contains_root = lambda _x, _y: True  # type: ignore[method-assign]
+            app.right_bottom_column.contains_root = lambda _x, _y: False  # type: ignore[method-assign]
+            left_hits: list[int] = []
+            right_hits: list[int] = []
+            app.left_column._on_mousewheel = lambda _e: left_hits.append(1) or "break"  # type: ignore[method-assign]
+            app.right_column._on_mousewheel = lambda _e: right_hits.append(1) or "break"  # type: ignore[method-assign]
+            self.assertEqual(app._on_column_mousewheel(_FocusedPreview()), "break")
+            self.assertEqual(left_hits, [])
+            self.assertEqual(right_hits, [1])
         finally:
             root.destroy()
 
@@ -3958,7 +4792,6 @@ class TestOutputScale(unittest.TestCase):
                     app.texture_panel,
                     app.tone_panel,
                     app.scale_panel,
-                    app.crop_panel,
                 ],
             )
             self.assertFalse(app.tess_panel.hidden)
@@ -3968,6 +4801,7 @@ class TestOutputScale(unittest.TestCase):
                 app.right_bottom_column.panels,
                 [
                     app.layers_panel,
+                    app.crop_panel,
                     app.labels_panel,
                     app.tess_panel,
                     app.history_panel,
@@ -4002,7 +4836,9 @@ class TestOutputScale(unittest.TestCase):
                     "sash_fraction": 0.72,
                 }
             )
-            self.assertIn(app.crop_panel, app.right_column.panels)
+            self.assertIn(app.crop_panel, app.right_bottom_column.panels)
+            bot = app.right_bottom_column.panels
+            self.assertEqual(bot[bot.index(app.layers_panel) + 1], app.crop_panel)
             self.assertEqual(str(app.crop_panel.panel_title), "Position & Zoom")
         finally:
             root.destroy()
@@ -4046,6 +4882,7 @@ class TestMenubarEditState(unittest.TestCase):
             self.assertEqual(_menu_labels(app.menubar), ["File", "Edit", "View", "Tools", "Help"])
             file_labels = _menu_labels(app.file_menu)
             self.assertIn("Open image…", file_labels)
+            self.assertIn("Open swatch photo…", file_labels)
             self.assertIn("Save as…", file_labels)
             self.assertIn("Export job pack…", file_labels)
             self.assertIn("Export layers zip…", file_labels)
@@ -4855,6 +5692,7 @@ class TestColorWheelMixBars(unittest.TestCase):
 
     def test_commit_tint_and_tone_and_tailwind(self) -> None:
         import tkinter as tk
+        from tkinter import ttk
 
         from wallpaper_recolor.ui.color_wheel import ColorWheel, tailwind_palette
 
@@ -4875,6 +5713,54 @@ class TestColorWheelMixBars(unittest.TestCase):
             wheel.apply_tailwind_index(0, commit=True)
             self.assertEqual(wheel.current_rgb(), expected)
             self.assertEqual(len(wheel._mix_bars), 4)
+            self.assertIn("shades", wheel._mix_scales)
+            self.assertIn("tints", wheel._mix_scales)
+            self.assertIn("tones", wheel._mix_scales)
+            for kind in ("shades", "tints", "tones"):
+                self.assertIsInstance(wheel._mix_scales[kind], ttk.Scale)
+        finally:
+            root.destroy()
+
+    def test_mix_sliders_keep_value_until_reset(self) -> None:
+        import tkinter as tk
+
+        from wallpaper_recolor.ui.color_wheel import ColorWheel
+
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            wheel = ColorWheel(root)
+            wheel.set_rgb((255, 0, 0))
+            wheel.apply_mix("shades", 0.5, commit=True)
+            self.assertAlmostEqual(wheel._mix_t["shades"], 0.5, places=3)
+            mixed = wheel.current_rgb()
+            self.assertNotEqual(mixed, (255, 0, 0))
+            wheel._reset_mix_slider("shades")
+            self.assertAlmostEqual(wheel._mix_t["shades"], 0.0, places=3)
+            self.assertEqual(wheel.current_rgb(), (255, 0, 0))
+        finally:
+            root.destroy()
+
+    def test_complete_hex_records_history_immediately(self) -> None:
+        import tkinter as tk
+
+        from wallpaper_recolor.ui.color_wheel import ColorWheel
+
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            wheel = ColorWheel(root)
+            wheel.set_rgb((255, 0, 0))
+            wheel._commit()
+            wheel.hex_var.set("#0000FF")
+            wheel._hex_keyrelease()
+            self.assertEqual(wheel.current_rgb(), (0, 0, 255))
+            self.assertEqual(wheel.history_colors()[0], (0, 0, 255))
+            self.assertEqual(wheel.hex_var.get().upper(), "#0000FF")
+            wheel.rgbao_var.set("0, 255, 0, 255")
+            wheel._rgbao_keyrelease()
+            self.assertEqual(wheel.current_rgb(), (0, 255, 0))
+            self.assertEqual(wheel.history_colors()[0], (0, 255, 0))
         finally:
             root.destroy()
 
@@ -5247,6 +6133,73 @@ class TestLabels(unittest.TestCase):
         self.assertTrue(np.any(mask[10:16, 8:18]))
         self.assertFalse(np.any(mask[0:3, 50:64]))
         self.assertLess(int((mask > 0).sum()), 32 * 64 // 2)
+
+
+class TestSwatchMatch(unittest.TestCase):
+    """Photographed chip RGB + official Pantone → Color & lighting amounts."""
+
+    def test_identity_sample_is_neutral(self) -> None:
+        from wallpaper_recolor.color.pantone import lookup_pantone_rgb
+        from wallpaper_recolor.color.swatch_match import (
+            correction_for_pantone,
+            swatch_match_temp_tint_exposure,
+        )
+
+        target = lookup_pantone_rgb("186 C")
+        self.assertIsNotNone(target)
+        temp, tint, exposure = swatch_match_temp_tint_exposure(target, target)
+        self.assertAlmostEqual(temp, 0.0, places=5)
+        self.assertAlmostEqual(tint, 0.0, places=5)
+        self.assertAlmostEqual(exposure, 0.0, places=5)
+        self.assertEqual(correction_for_pantone(target, "186 C"), (temp, tint, exposure))
+        self.assertIsNone(correction_for_pantone(target, "not-a-real-pantone-code"))
+
+    def test_luma_lift_is_exposure(self) -> None:
+        from wallpaper_recolor.color.swatch_match import swatch_match_temp_tint_exposure
+        from wallpaper_recolor.color.tone import apply_tone_rgb
+
+        sampled = (80, 80, 80)
+        target = (160, 160, 160)
+        temp, tint, exposure = swatch_match_temp_tint_exposure(sampled, target)
+        self.assertAlmostEqual(temp, 0.0, places=5)
+        self.assertAlmostEqual(tint, 0.0, places=5)
+        self.assertGreater(exposure, 0.5)
+        rgb = np.full((8, 8, 3), sampled, dtype=np.uint8)
+        out = apply_tone_rgb(rgb, temperature=temp, tint=tint, exposure=exposure)
+        np.testing.assert_allclose(out[0, 0], target, atol=2)
+
+    def test_cast_moves_sampled_toward_pantone(self) -> None:
+        from wallpaper_recolor.color.pantone import lookup_pantone_rgb
+        from wallpaper_recolor.color.swatch_match import (
+            correction_for_pantone,
+            mean_rgb_at,
+            swatch_match_temp_tint_exposure,
+        )
+        from wallpaper_recolor.color.tone import apply_tone_rgb
+
+        sampled = (200, 150, 100)
+        target = (150, 150, 150)
+        temp, tint, exposure = swatch_match_temp_tint_exposure(sampled, target)
+        self.assertLess(temp, -0.05)
+        rgb = np.full((12, 12, 3), sampled, dtype=np.uint8)
+        out = apply_tone_rgb(rgb, temperature=temp, tint=tint, exposure=exposure)
+        before = float(np.linalg.norm(np.array(sampled, dtype=np.float64) - target))
+        after = float(np.linalg.norm(out[0, 0].astype(np.float64) - target))
+        self.assertLess(after, before)
+        pantone = lookup_pantone_rgb("186 C")
+        self.assertIsNotNone(pantone)
+        warm = (
+            min(255, int(pantone[0]) + 20),
+            min(255, int(pantone[1]) + 12),
+            max(0, int(pantone[2]) - 12),
+        )
+        amounts = correction_for_pantone(warm, "186 C")
+        self.assertIsNotNone(amounts)
+        self.assertTrue(any(abs(float(a)) > 0.02 for a in amounts))
+        frame = np.zeros((10, 10, 3), dtype=np.uint8)
+        frame[:] = (10, 20, 30)
+        frame[3:8, 3:8] = (200, 40, 40)
+        self.assertEqual(mean_rgb_at(frame, 5, 5, radius=1), (200, 40, 40))
 
 
 class TestPantoneTable(unittest.TestCase):
@@ -5709,6 +6662,74 @@ class TestLayerStack(unittest.TestCase):
             from wallpaper_recolor.layers.stack import correction_target_ids
 
             self.assertIn(base.id, correction_target_ids(app.layer_stack))
+        finally:
+            root.destroy()
+
+    def test_range_kebab_menu_remove(self) -> None:
+        """Each Layers range row has a ⋯ menu; Remove deletes that range and is undoable."""
+        import tkinter as tk
+
+        import wallpaper_recolor.ui.app as ui_mod
+
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            app = ui_mod.WallpaperRecolorApp(root)
+            rng = np.random.default_rng(11)
+            im = Image.fromarray(
+                rng.integers(20, 230, (24, 24, 3), dtype=np.uint8), mode="RGB"
+            )
+            app.work_image = im
+            app.source_image = im
+            app.range_count.set(3)
+            app.rebuild_ranges()
+            self.assertIsNotNone(app.range_map)
+            self.assertEqual(len(app.range_map.ranges), 3)
+            app.range_map.set_replacement(0, (9, 9, 9))
+            app.range_map.set_replacement(1, (11, 22, 33))
+            app.range_map.set_replacement(2, (44, 55, 66))
+            app.range_map.ranges[0].name = "Keep A"
+            app.range_map.ranges[2].name = "Keep C"
+            app._refresh_layers_panel()
+            self.assertEqual(len(app._layer_range_rows), 3)
+            for index, widgets in app._layer_range_rows.items():
+                kebab = widgets["kebab"]
+                menu = widgets["menu"]
+                self.assertEqual(str(kebab.cget("text")), ui_mod._LAYER_KEBAB)
+                self.assertEqual(kebab.winfo_class(), "Label")
+                self.assertEqual(_menu_labels(menu)[0], "Remove")
+                self.assertEqual(str(menu.entrycget(0, "state")), "normal")
+            before_n = len(app.range_map.ranges)
+            app._layer_range_rows[1]["menu"].invoke(0)
+            self.assertEqual(len(app.range_map.ranges), before_n - 1)
+            self.assertEqual(int(app.range_count.get()), 2)
+            self.assertEqual(len(app._layer_range_rows), 2)
+            self.assertEqual(
+                [ly.range_index for ly in app.layer_stack.layers if ly.is_range()],
+                [0, 1],
+            )
+            self.assertEqual(app.range_map.ranges[0].replacement_rgb, (9, 9, 9))
+            self.assertEqual(app.range_map.ranges[1].replacement_rgb, (44, 55, 66))
+            self.assertEqual(app.range_map.ranges[0].name, "Keep A")
+            self.assertEqual(app.range_map.ranges[1].name, "Keep C")
+            self.assertEqual(len(app.coverage.weights), 2)
+            self.assertAlmostEqual(sum(app.coverage.weights), 1.0, places=5)
+            self.assertGreaterEqual(len(app._undo_stack), 1)
+            app.undo_edit()
+            self.assertEqual(len(app.range_map.ranges), 3)
+            self.assertEqual(int(app.range_count.get()), 3)
+            self.assertEqual(app.range_map.ranges[1].replacement_rgb, (11, 22, 33))
+            self.assertEqual(len(app._layer_range_rows), 3)
+            self.assertEqual(len(app.coverage.weights), 3)
+            app._on_remove_layer_range(0)
+            app._on_remove_layer_range(0)
+            self.assertEqual(len(app.range_map.ranges), 1)
+            last = app._layer_range_rows[0]
+            self.assertEqual(str(last["menu"].entrycget(0, "state")), "disabled")
+            app._on_remove_layer_range(0)
+            last["menu"].invoke(0)
+            self.assertEqual(len(app.range_map.ranges), 1)
+            self.assertEqual(len(app._layer_range_rows), 1)
         finally:
             root.destroy()
 
@@ -6299,7 +7320,12 @@ class TestLayerStack(unittest.TestCase):
         import tkinter as tk
 
         import wallpaper_recolor.ui.app as ui_mod
-        from wallpaper_recolor.ui.cluster_view import CLUSTER_HINT
+        from wallpaper_recolor.ui.cluster_view import (
+            CLUSTER_HINT,
+            FACE_LABELS,
+            MODE_LABEL_REPLACE,
+            MODE_REPLACE,
+        )
 
         root = tk.Tk()
         root.withdraw()
@@ -6322,6 +7348,18 @@ class TestLayerStack(unittest.TestCase):
             self.assertIn("Middle-drag", CLUSTER_HINT)
             self.assertNotIn("loupe", CLUSTER_HINT.lower())
             self.assertNotIn("Home", CLUSTER_HINT)
+            self.assertNotIn("lab", CLUSTER_HINT.lower())
+            self.assertEqual(plot.mode_key(), MODE_REPLACE)
+            self.assertEqual(str(plot._mode.get()), MODE_LABEL_REPLACE)
+            self.assertNotIn("lab", str(plot._status.get()).lower())
+            self.assertNotIn("cie", str(plot._status.get()).lower())
+            for face_title in FACE_LABELS.values():
+                self.assertNotIn("*", face_title)
+                self.assertNotIn("lab", face_title.lower())
+            if plot._ax is not None:
+                self.assertEqual(str(plot._ax.get_xlabel()), "")
+                self.assertEqual(str(plot._ax.get_ylabel()), "")
+                self.assertEqual(str(plot._ax.get_zlabel()), "")
         finally:
             root.destroy()
 
@@ -6413,5 +7451,220 @@ class TestLayerStack(unittest.TestCase):
             root.destroy()
 
 
+def _write_srgb_icc(path: Path) -> Path:
+    from PIL import ImageCms
+
+    profile = ImageCms.ImageCmsProfile(ImageCms.createProfile("sRGB"))
+    path.write_bytes(profile.tobytes())
+    return path
+
+
+def _write_onyx_pack(
+    folder: Path,
+    *,
+    media: str = "Generic Smooth Wall Covering 460-MUS2506",
+    mode: str = "Matte Production",
+    zip_name: str = "Generic Smooth Wall Covering 460-MUS2506.zip",
+) -> Path:
+    """Minimal ONYX zip: XML media/mode + one embedded sRGB ICC blob."""
+    import zipfile
+
+    from PIL import ImageCms
+
+    icc = ImageCms.ImageCmsProfile(ImageCms.createProfile("sRGB")).tobytes()
+    xml = (
+        b'<?xml version="1.0"?>\n'
+        b'<node name="DllDevice" value="Canon Colorado M-Series"/>\n'
+        + f'<node name="PrintMode" value="{mode}"/>\n'.encode("ascii")
+        + f'MediaTypeName {{ "{media}" }}\n'.encode("ascii")
+    )
+    dest = folder / zip_name
+    with zipfile.ZipFile(dest, "w") as archive:
+        archive.writestr(f"{media}.OML", b"OVOL\x08\x00\x00\x00" + xml + icc)
+    return dest
+
+
+class TestIccProfileMenu(unittest.TestCase):
+    """ICC toolbar dropdown: list folder, post menu, apply, tooltips, undo."""
+
+    def test_list_profiles_from_temp_dir_and_default_folder(self) -> None:
+        from wallpaper_recolor.io.proof import (
+            DEFAULT_ICC_PROFILES_DIR,
+            list_icc_profiles,
+            profile_tooltip,
+            read_profile_description,
+        )
+
+        listed = list_icc_profiles(DEFAULT_ICC_PROFILES_DIR)
+        self.assertIsInstance(listed, list)
+        with tempfile.TemporaryDirectory() as raw:
+            folder = Path(raw)
+            icc = _write_srgb_icc(folder / "PrinterFoo.icc")
+            icm = _write_srgb_icc(folder / "Canvas_Proof.icm")
+            (folder / "notes.txt").write_text("not a profile", encoding="utf-8")
+            bare = folder / "canon_media"
+            bare.write_bytes(icc.read_bytes())
+            names = {p.name.lower() for p in list_icc_profiles(folder)}
+            self.assertEqual(names, {"printerfoo.icc", "canvas_proof.icm", "canon_media"})
+            desc = read_profile_description(icc)
+            self.assertTrue(desc)
+            tip = profile_tooltip(icc)
+            self.assertIn("sRGB", tip)
+            self.assertIn("Converts the preview from sRGB", tip)
+            canvas = folder / "Generic Canvas 460-MUS2506.icc"
+            _write_srgb_icc(canvas)
+            self.assertIn("Canon Colorado", profile_tooltip(canvas))
+            self.assertIn("printer/media", profile_tooltip(canvas).lower())
+
+    def test_missing_folder_lists_empty(self) -> None:
+        from wallpaper_recolor.io.proof import list_icc_profiles
+
+        self.assertEqual(
+            list_icc_profiles(Path(r"C:\definitely-missing-wallpaper-icc-folder")),
+            [],
+        )
+
+    def test_onyx_oml_pack_lists_mseries_media_and_mode(self) -> None:
+        from wallpaper_recolor.io.proof import (
+            apply_icc,
+            list_icc_profiles,
+            profile_menu_label,
+            profile_tooltip,
+        )
+
+        with tempfile.TemporaryDirectory() as raw:
+            folder = Path(raw)
+            _write_onyx_pack(folder)
+            listed = list_icc_profiles(folder)
+            self.assertEqual(len(listed), 1)
+            label = profile_menu_label(listed[0])
+            self.assertIn("Generic Smooth Wall Covering", label)
+            self.assertIn("Matte Production", label)
+            tip = profile_tooltip(listed[0])
+            self.assertIn("Canon Colorado M-Series", tip)
+            self.assertIn("Matte Production", tip)
+            self.assertIn("printer/media", tip.lower())
+            im = Image.new("RGB", (8, 8), (200, 40, 40))
+            out = apply_icc(im, listed[0])
+            self.assertEqual(out.size, im.size)
+
+    def test_default_folder_lists_colorado_onyx_when_packs_present(self) -> None:
+        from wallpaper_recolor.io.proof import (
+            DEFAULT_ICC_PROFILES_DIR,
+            list_icc_profiles,
+            profile_menu_label,
+            profile_tooltip,
+        )
+
+        canvas = DEFAULT_ICC_PROFILES_DIR / "Generic Canvas 460-MUS2506.zip"
+        if not canvas.is_file():
+            self.skipTest("Canon Generic Canvas Onyx zip not in Color Profiles")
+        listed = list_icc_profiles(DEFAULT_ICC_PROFILES_DIR)
+        labels = [profile_menu_label(path) for path in listed]
+        self.assertTrue(
+            any("Generic Canvas 460-MUS2506" in label for label in labels),
+            labels[:8],
+        )
+        self.assertTrue(any("Matte Production" in label for label in labels), labels)
+        canvas_paths = [
+            path
+            for path in listed
+            if "Generic Canvas 460-MUS2506" in profile_menu_label(path)
+        ]
+        tip = profile_tooltip(canvas_paths[0])
+        self.assertIn("Canon Colorado M-Series", tip)
+        self.assertIn("Generic Canvas", tip)
+
+    def test_apply_icc_converts_preview_pixels(self) -> None:
+        from wallpaper_recolor.io.proof import apply_icc
+
+        im = Image.new("RGB", (8, 8), (200, 40, 40))
+        self.assertIs(apply_icc(im, None), im)
+        with tempfile.TemporaryDirectory() as raw:
+            path = _write_srgb_icc(Path(raw) / "sRGB.icc")
+            out = apply_icc(im, path)
+            self.assertEqual(out.size, im.size)
+            self.assertEqual(out.mode, "RGB")
+
+    def test_click_builds_menu_and_select_applies(self) -> None:
+        import tkinter as tk
+        from unittest.mock import patch
+
+        import wallpaper_recolor.ui.app as ui_mod
+        from wallpaper_recolor.ui.tooltip import _MENU_TIPS_ATTR
+
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            with tempfile.TemporaryDirectory() as raw:
+                folder = Path(raw)
+                profile = _write_srgb_icc(folder / "PrinterFoo.icc")
+                app = ui_mod.WallpaperRecolorApp(root)
+                app._icc_profiles_dir_override = folder
+                self.assertEqual(str(app.icc_btn.cget("text")), "ICC profile (sRGB)")
+                with patch.object(tk.Menu, "tk_popup") as popup:
+                    app.pick_icc()
+                    popup.assert_called_once()
+                labels = _menu_labels(app.icc_menu)
+                self.assertEqual(labels[0], "sRGB")
+                self.assertIn("PrinterFoo", labels)
+                tips = getattr(app.icc_menu, _MENU_TIPS_ATTR)
+                self.assertIn("working space", tips[0].lower())
+                profile_idx = None
+                end = app.icc_menu.index("end")
+                for i in range(int(end) + 1):
+                    try:
+                        if str(app.icc_menu.entrycget(i, "label")) == "PrinterFoo":
+                            profile_idx = i
+                            break
+                    except Exception:
+                        continue
+                self.assertIsNotNone(profile_idx)
+                self.assertIn("sRGB", tips[profile_idx])
+
+                rng = np.random.default_rng(4)
+                im = Image.fromarray(
+                    rng.integers(20, 230, (24, 24, 3), dtype=np.uint8), mode="RGB"
+                )
+                app.work_image = im
+                app.source_image = im
+                app.range_count.set(2)
+                app.rebuild_ranges()
+                self.assertIsNotNone(app.range_map)
+
+                def _red(image, icc_path):
+                    return Image.new("RGB", image.size, (255, 0, 0))
+
+                with patch(
+                    "wallpaper_recolor.ui.mixins.preview.apply_icc", side_effect=_red
+                ):
+                    app.icc_menu.invoke(profile_idx)
+                    self.assertEqual(app.icc_path, profile)
+                    self.assertIn("PrinterFoo", str(app.icc_btn.cget("text")))
+                    self.assertEqual(app._tex_pil.getpixel((0, 0))[:3], (255, 0, 0))
+                self.assertGreaterEqual(len(app._undo_stack), 1)
+                app.undo_edit()
+                self.assertIsNone(app.icc_path)
+                self.assertEqual(str(app.icc_btn.cget("text")), "ICC profile (sRGB)")
+
+                empty = folder / "empty"
+                empty.mkdir()
+                app._icc_profiles_dir_override = empty
+                empty_labels = _menu_labels(app._build_icc_menu())
+                self.assertIn("No ICC profiles in this folder", empty_labels)
+
+                app._icc_profiles_dir_override = Path(
+                    r"C:\definitely-missing-wallpaper-icc-folder"
+                )
+                missing_menu = app._build_icc_menu()
+                missing_labels = _menu_labels(missing_menu)
+                self.assertIn("Color Profiles folder not found", missing_labels)
+                last = int(missing_menu.index("end"))
+                self.assertEqual(str(missing_menu.entrycget(last, "state")), "disabled")
+        finally:
+            root.destroy()
+
+
 if __name__ == "__main__":
     unittest.main()
+

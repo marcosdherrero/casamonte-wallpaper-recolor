@@ -17,6 +17,7 @@ from wallpaper_recolor.ui.mixins.preview import AppPreviewMixin
 from wallpaper_recolor.ui.mixins.adjust import AppAdjustMixin
 from wallpaper_recolor.ui.mixins.session import AppSessionMixin
 from wallpaper_recolor.ui.mixins.ranges import AppRangesMixin
+from wallpaper_recolor.ui.mixins.swatch import AppSwatchMixin
 
 __all__ = (
     "AppChromeMixin",
@@ -26,4 +27,5 @@ __all__ = (
     "AppAdjustMixin",
     "AppSessionMixin",
     "AppRangesMixin",
+    "AppSwatchMixin",
 )

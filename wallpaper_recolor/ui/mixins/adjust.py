@@ -107,6 +107,7 @@ from wallpaper_recolor.transform.tessellate import (
     TILES_MAX,
     TILES_MIN,
     apply_crop_lighting_tessellate,
+    apply_normalize_lighting,
     apply_tessellate,
     clamp_lloyd,
     clamp_tiles,
@@ -114,6 +115,7 @@ from wallpaper_recolor.transform.tessellate import (
     coerce_normalize_lighting,
     edges_already_match,
     estimate_normalize_tone,
+    image_already_periodic,
     normalize_h_side,
     normalize_tess_mode,
     normalize_v_side,
@@ -684,12 +686,20 @@ class AppAdjustMixin:
         )
 
     def _apply_view_transform(self, image: Image.Image, *, include_tone: bool = False) -> Image.Image:
-        """Crop → optional Tone → tessellate. Original preview omits tone; lighting is Darks/Lights on Result."""
+        """Crop → optional Tone + lighting flatten → tessellate.
+
+        Flatten rides with Tone so Original (include_tone=False) stays the
+        source crop. Result preview uses ``_preview_pils`` for the same steps.
+        """
         x, y, z = self._crop_xy_zoom()
         h_side, v_side, built, mode = self._tess_params()
-        image = apply_crop(image, x, y, z, src_size=self._crop_src_size())
+        image = apply_crop(
+            image, x, y, z, src_size=self._crop_src_size()
+        )
         if include_tone:
             image = self._apply_view_tone(image)
+            if self._tess_normalize_on():
+                image = apply_normalize_lighting(image)
         return apply_tessellate(
             image,
             h_side,
@@ -720,10 +730,16 @@ class AppAdjustMixin:
         if normalize_tess_mode(self.tess_mode.get()) == MODE_MESH:
             return None
         rgb = self.work_image.convert("RGB")
+        if self._tess_normalize_on():
+            rgb = apply_normalize_lighting(rgb)
         arr = np.asarray(rgb)
-        if edges_already_match(arr, h_side, v_side):
+        mode = self._tess_params()[3]
+        if normalize_tess_mode(mode) == MODE_TILE:
+            if image_already_periodic(arr, h_side, v_side):
+                return None
+        elif edges_already_match(arr, h_side, v_side):
             return None
-        lx, ly, lz = plan_tessellate_crop(arr, h_side, v_side, mode=self._tess_params()[3])
+        lx, ly, lz = plan_tessellate_crop(arr, h_side, v_side, mode=mode)
         if lx == 0 and ly == 0 and abs(float(lz) - 1.0) < 1e-6:
             return None
         wh, ww = int(arr.shape[0]), int(arr.shape[1])
@@ -814,7 +830,13 @@ class AppAdjustMixin:
         new_h = normalize_h_side(self.tess_h.get())
         new_v = normalize_v_side(self.tess_v.get())
         new_mode = normalize_tess_mode(self.tess_mode.get())
-        if new_h == SIDE_OFF and new_v == SIDE_OFF:
+        # Tile keeps Off as Off — forcing Left/Top wrapped leftover and smeared
+        # the left column even when Horizontal/Vertical were Off.
+        if (
+            new_mode != MODE_TILE
+            and new_h == SIDE_OFF
+            and new_v == SIDE_OFF
+        ):
             new_h, new_v = SIDE_LEFT, SIDE_TOP
         planned = None
         if new_mode != MODE_MESH:
@@ -836,14 +858,6 @@ class AppAdjustMixin:
         if planned is not None:
             self._set_crop_xy_zoom(*planned)
         self._tess_committed = (new_h, new_v, True, new_mode)
-        if self._tess_normalize_on():
-            d, li, _b = self._tone_amounts()
-            eps = 0.02
-            if (
-                abs(d - self._lighting_auto_darks) < eps
-                and abs(li - self._lighting_auto_lights) < eps
-            ):
-                self._apply_normalize_to_tone()
         self._sync_slider_resets()
         self._push_undo_state(before)
         self._cancel_preview_job()
@@ -905,7 +919,7 @@ class AppAdjustMixin:
         self._set_tone_sliders(darks, lights)
 
     def _on_tess_normalize(self) -> None:
-        """One-shot flatten estimate → Darks/Lights, like Tessellate Build."""
+        """Turn on spatial lighting flatten (bowl / ramp). Darks/Lights stay independent."""
         if self._mute_ui or self._tess_updating:
             return
         before = self._capture_edit()
@@ -914,7 +928,6 @@ class AppAdjustMixin:
             self.tess_normalize.set(True)
         finally:
             self._tess_updating = False
-        self._apply_normalize_to_tone()
         self._sync_slider_resets()
         self._push_undo_state(before)
         self._refresh_now()
@@ -995,18 +1008,11 @@ class AppAdjustMixin:
         self._push_undo_state(before)
 
     def _normalize_lighting_dirty(self) -> bool:
-        """Reset when Normalize has run, or Darks/Lights left 0."""
-        if self._tess_normalize_on():
-            return True
-        try:
-            d = float(self.darks_pct.get())
-            li = float(self.lights_pct.get())
-        except (tk.TclError, ValueError):
-            return False
-        return abs(d - TONE_NEUTRAL) >= _RESET_EPS or abs(li - TONE_NEUTRAL) >= _RESET_EPS
+        """Reset when Normalize lighting is on."""
+        return self._tess_normalize_on()
 
     def _reset_tess_normalize(self) -> None:
-        """Zero Darks/Lights and clear the Normalize flag — lighting identity."""
+        """Clear the spatial flatten flag. Darks/Lights keep their own reset."""
         if not self._normalize_lighting_dirty():
             return
         before = self._capture_edit()
@@ -1017,7 +1023,6 @@ class AppAdjustMixin:
             self._tess_updating = False
         self._lighting_auto_darks = 0.0
         self._lighting_auto_lights = 0.0
-        self._set_tone_sliders(0.0, 0.0)
         self._sync_slider_resets()
         self._push_undo_state(before)
         self._schedule_preview()
@@ -1274,30 +1279,8 @@ class AppAdjustMixin:
         self.range_map.tone_lights_yellow = kwargs["balance_yellow"]
 
     def _sync_normalize_from_tone_sliders(self) -> None:
-        """Normalize lighting is Darks/Lights. Zeroing both clears the flag.
-
-        Moving Darks/Lights after a flatten is a creative grade: the flag
-        stays on, but Build will not re-flatten on top (it only refreshes when
-        sliders still match the stored estimate). Lights RGB is a highlight
-        channel multiply (Gray World / White Patch), not the Lights mix-to-white,
-        so those sliders stay independent — folding them would double-apply
-        different operators as if they were one grade. Contrast / Exposure
-        are global and also independent of the flatten estimate.
-        """
-        if self._mute_ui or self._tess_updating:
-            return
-        if not self._tess_normalize_on():
-            return
-        d, li, _b = self._tone_amounts()
-        if abs(d) >= 0.02 or abs(li) >= 0.02:
-            return
-        self._tess_updating = True
-        try:
-            self.tess_normalize.set(False)
-        finally:
-            self._tess_updating = False
-        self._lighting_auto_darks = 0.0
-        self._lighting_auto_lights = 0.0
+        """Darks/Lights are a separate grade from spatial Normalize lighting."""
+        return
 
     def _on_tone_slider(self, _value: str) -> None:
         """Darks / lights / brightness / WB / CMY — same debounce as the wheel; 0 is identity."""

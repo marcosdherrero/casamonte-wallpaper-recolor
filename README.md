@@ -20,9 +20,9 @@ pip install -r requirements.txt
 python run_app.py
 ```
 
-Or double-click `Run Wallpaper Recolor.bat`.
+Or double-click `Run-GlobalPython.bat` (uses PATH `python`).
 
-Coworkers without Python: unzip a **Release** setup zip and run **Install.bat** once (needs network; installs CPython into `runtime\`, no admin). After that, **WallpaperRecolor.bat**. See `COWORKER.md`.
+Coworkers without Python: unzip a **Release** setup zip and run **Install.bat** once (needs network; installs CPython into `runtime\`, no admin). After that, **Run-LocalPython.bat**. See `COWORKER.md`.
 
 Optional extras:
 

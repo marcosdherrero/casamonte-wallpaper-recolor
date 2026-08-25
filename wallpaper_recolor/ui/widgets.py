@@ -25,7 +25,6 @@ from PIL import ImageTk
 
 from wallpaper_recolor.color.color_ranges import ColorRangeMap
 from wallpaper_recolor.color.tone import TONE_SLIDER_MAX, TONE_SLIDER_MIN
-from wallpaper_recolor.ui.coverage_bar import HALF_REPLACE
 from wallpaper_recolor.ui.tooltip import bind_tooltip
 from wallpaper_recolor.transform.crop import clamp_zoom
 from wallpaper_recolor.ui.constants import (

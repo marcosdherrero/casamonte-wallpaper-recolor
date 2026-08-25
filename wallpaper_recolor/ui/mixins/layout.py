@@ -76,7 +76,7 @@ from wallpaper_recolor.ui.cluster_view import (
     cluster_scatter_data,
 )
 from wallpaper_recolor.ui.coverage_bar import HALF_MATCH, HALF_REPLACE, CoverageBar
-from wallpaper_recolor.ui.tooltip import bind_tooltip
+from wallpaper_recolor.ui.tooltip import bind_tooltip, hover_tip_of
 from wallpaper_recolor.io.export_layers_zip import export_layers_zip as write_layers_zip
 from wallpaper_recolor.io.export_pack import export_job_pack
 from wallpaper_recolor.transform.crop import (
@@ -243,11 +243,14 @@ from wallpaper_recolor.ui.icons import (
 from wallpaper_recolor.ui.preview_fit import (
     PreviewZoomHost,
     _format_zoom_text,
+    _is_independent_toplevel,
+    _is_pointer_overlay,
     _preview_base_size,
     _scale_view_zoom,
     _view_zoom_size,
     _wheel_zoom_pct_delta,
     _widget_contains_root,
+    widget_at_root,
     clamp_view_zoom_pct,
     contain_size,
     fit_max_edge,
@@ -276,6 +279,126 @@ from wallpaper_recolor.ui.snapshot import (
     _json_rgb,
     default_layout_profiles_path,
 )
+
+PREVIEW_TAB_STYLE = f"{PREVIEW_NOTEBOOK_STYLE}.Tab"
+
+
+def _plain_notebook_tab_element(style: ttk.Style) -> str:
+    """Clam/default tab element so background colors apply on Windows vista."""
+    name = "plain.Notebook.tab"
+    try:
+        names = set(style.element_names())
+    except tk.TclError:
+        names = set()
+    if name in names:
+        return name
+    for theme in ("clam", "alt", "default"):
+        try:
+            style.element_create(name, "from", theme)
+            return name
+        except tk.TclError:
+            continue
+    return "Notebook.tab"
+
+
+def apply_preview_notebook_style(style: ttk.Style | None = None) -> ttk.Style:
+    """High-contrast preview tabs; selected stays obvious when the window is unfocused."""
+    style = style or ttk.Style()
+    tab_style = PREVIEW_TAB_STYLE
+    tab_element = _plain_notebook_tab_element(style)
+    try:
+        style.layout(PREVIEW_NOTEBOOK_STYLE, style.layout("TNotebook"))
+    except tk.TclError:
+        pass
+    style.layout(
+        tab_style,
+        [
+            (
+                tab_element,
+                {
+                    "sticky": "nswe",
+                    "children": [
+                        (
+                            "Notebook.padding",
+                            {
+                                "side": "top",
+                                "sticky": "nswe",
+                                "children": [
+                                    (
+                                        "Notebook.focus",
+                                        {
+                                            "side": "top",
+                                            "sticky": "nswe",
+                                            "children": [
+                                                ("Notebook.label", {"sticky": "nswe"}),
+                                            ],
+                                        },
+                                    ),
+                                ],
+                            },
+                        ),
+                    ],
+                },
+            ),
+        ],
+    )
+    style.configure(
+        PREVIEW_NOTEBOOK_STYLE,
+        background=PREVIEW_PANE_BG,
+        borderwidth=0,
+        tabmargins=(4, 6, 4, 0),
+    )
+    style.configure(
+        tab_style,
+        background=PREVIEW_TAB_IDLE_BG,
+        foreground=PREVIEW_TAB_IDLE_FG,
+        lightcolor=PREVIEW_TAB_IDLE_BG,
+        darkcolor=PREVIEW_TAB_IDLE_BG,
+        bordercolor=PREVIEW_TAB_BORDER,
+        font=PREVIEW_TAB_FONT,
+        padding=PREVIEW_TAB_PADDING,
+        focuscolor=PREVIEW_TAB_SELECTED_BG,
+    )
+    # selected before !selected / !focus so an unfocused window keeps the active tab
+    style.map(
+        tab_style,
+        background=[
+            ("selected", PREVIEW_TAB_SELECTED_BG),
+            ("!selected", PREVIEW_TAB_IDLE_BG),
+        ],
+        foreground=[
+            ("selected", PREVIEW_TAB_SELECTED_FG),
+            ("!selected", PREVIEW_TAB_IDLE_FG),
+        ],
+        lightcolor=[
+            ("selected", PREVIEW_TAB_SELECTED_BG),
+            ("!selected", PREVIEW_TAB_IDLE_BG),
+        ],
+        darkcolor=[
+            ("selected", PREVIEW_TAB_ACCENT),
+            ("!selected", PREVIEW_TAB_IDLE_BG),
+        ],
+        bordercolor=[
+            ("selected", PREVIEW_TAB_ACCENT),
+            ("!selected", PREVIEW_TAB_BORDER),
+        ],
+        expand=[("selected", (1, 1, 1, 0))],
+    )
+    try:
+        style.map(
+            tab_style,
+            font=[
+                ("selected", PREVIEW_TAB_FONT_SELECTED),
+                ("!selected", PREVIEW_TAB_FONT),
+            ],
+            padding=[
+                ("selected", PREVIEW_TAB_PADDING_SELECTED),
+                ("!selected", PREVIEW_TAB_PADDING),
+            ],
+        )
+    except tk.TclError:
+        pass
+    return style
 
 
 class AppLayoutMixin:
@@ -309,7 +432,8 @@ class AppLayoutMixin:
         bind_tooltip(
             self.tools_combo,
             "View Move: pan and wheel-zoom the preview camera. "
-            "Grab Move: drag the selected image inside the output frame (Position & Zoom X/Y).",
+            "Grab Move: drag the selected overlay or label on Result; "
+            "with the base wallpaper selected, pan a zoomed preview.",
         )
 
         ttk.Label(toolbar, text="Presets:").pack(side="left")
@@ -338,6 +462,7 @@ class AppLayoutMixin:
             toolbar,
             from_=MIN_RANGES,
             to=MAX_RANGES,
+            increment=1,
             textvariable=self.range_count,
             width=4,
             command=self._on_range_count,
@@ -345,7 +470,10 @@ class AppLayoutMixin:
         spin.pack(side="left", padx=(4, 12))
         spin.bind("<Return>", lambda _e: self._on_range_count())
         spin.bind("<FocusOut>", lambda _e: self._on_range_count())
+        # ttk::Repeatedly on the arrows would +2 when rebuild is slower than 300ms.
+        spin.bind("<ButtonPress-1>", self._on_range_spin_press)
         self.range_spin = spin
+        _bind_wheel_tree(spin, self._on_column_mousewheel)
         bind_tooltip(
             spin,
             "Add or remove a color range. Existing match-from / change-to colors stay; "
@@ -358,10 +486,16 @@ class AppLayoutMixin:
             textvariable=self.range_by,
             values=list(RANGE_BY_LABELS),
             state="readonly",
-            width=20,
+            width=22,
         )
         self.range_by_combo.pack(side="left", padx=(4, 12))
         self._bind_readonly_combo(self.range_by_combo, self._on_range_by)
+        bind_tooltip(
+            self.range_by_combo,
+            "How ranges are cut: color closeness (Lab clusters), Rec. 709 luma, "
+            "a* (green–red), b* (blue–yellow), or C* chroma (hypot of a* and b*, "
+            "the 45° distance from gray in the a*–b* plane).",
+        )
 
         self.assign_caption = ttk.Label(toolbar, text="Assign:")
         self.assign_combo = ttk.Combobox(
@@ -418,17 +552,39 @@ class AppLayoutMixin:
         self.bin_start_spin.bind("<FocusOut>", lambda _e: self._on_bin_limits())
         bind_tooltip(
             self.bin_start_spin,
-            "Lower edge of range 1. Rec. 709 luma 0–255, L* 0–100, a*/b* −128–127. "
-            "Pixels below Start stay original (unlabeled).",
+            "Lower edge of range 1. Rec. 709 luma 0–255, L* 0–100, a*/b* −128–127, "
+            "C* chroma 0–180. Pixels below Start stay original (unlabeled).",
         )
 
         self.reset_btn = ttk.Button(toolbar, text="Reset colors", command=self.reset_colors)
         self.reset_btn.pack(side="left")
-        ttk.Button(toolbar, text="ICC profile…", command=self.pick_icc).pack(side="left", padx=(12, 0))
+        self.icc_btn = ttk.Button(
+            toolbar,
+            text="ICC profile (sRGB)",
+            command=self.pick_icc,
+        )
+        self.icc_btn.pack(side="left", padx=(12, 0))
+        bind_tooltip(
+            self.icc_btn,
+            "Output / working ICC profile. Click to choose from Color Profiles; "
+            "sRGB is the default screen space.",
+        )
+        self.icc_menu = tk.Menu(self.icc_btn, tearoff=0)
+        self._sync_icc_button()
         self._sync_range_by_controls()
 
         # Two columns + sash: left = preview/coverage; right = vertical split (filters / layers)
-        self.body_paned = ttk.Panedwindow(self.root, orient="horizontal")
+        # Classic PanedWindow + opaqueresize: panes slide with the pointer (no ttk proxy ghost).
+        self._sash_live = False
+        self.body_paned = _SashSplit(
+            self.root,
+            orient="horizontal",
+            sashwidth=8,
+            sashrelief="raised",
+            bd=0,
+            sashpad=2,
+            opaqueresize=True,
+        )
         self.body_paned.pack(fill="both", expand=True, padx=8, pady=(0, 4))
         self.left_column = ScrollColumn(self.body_paned, self, "left")
         self.right_host = _SashSplit(
@@ -438,6 +594,7 @@ class AppLayoutMixin:
             sashrelief="raised",
             bd=0,
             sashpad=2,
+            opaqueresize=True,
         )
         self.right_top_column = ScrollColumn(self.right_host, self, "right_top")
         self.right_bottom_column = ScrollColumn(self.right_host, self, "right_bottom")
@@ -488,7 +645,7 @@ class AppLayoutMixin:
             float_size="520x240",
         )
         self.crop_panel = DockablePanel(
-            self.right_top_column,
+            self.right_bottom_column,
             self,
             CROP_PANEL_TITLE,
             pane_weight=0,
@@ -555,8 +712,8 @@ class AppLayoutMixin:
         self.right_top_column.attach(self.texture_panel)
         self.right_top_column.attach(self.tone_panel)
         self.right_top_column.attach(self.scale_panel)
-        self.right_top_column.attach(self.crop_panel)
         self.right_bottom_column.attach(self.layers_panel)
+        self.right_bottom_column.attach(self.crop_panel)
         self.right_bottom_column.attach(self.labels_panel)
         self.right_bottom_column.attach(self.tess_panel)
         self.right_bottom_column.attach(self.history_panel)
@@ -585,8 +742,16 @@ class AppLayoutMixin:
             self.right_host.pane(self.right_bottom_column, minsize=RIGHT_SPLIT_MINSIZE, weight=1)
         except tk.TclError:
             pass
-        self.body_paned.add(self.left_column, weight=LEFT_COL_WEIGHT)
-        self.body_paned.add(self.right_host, weight=RIGHT_COL_WEIGHT)
+        self.body_paned.add(
+            self.left_column,
+            minsize=LEFT_COL_MINSIZE,
+            stretch="always",
+        )
+        self.body_paned.add(
+            self.right_host,
+            minsize=RIGHT_COL_MINSIZE,
+            stretch="always",
+        )
         try:
             self.body_paned.pane(self.left_column, minsize=LEFT_COL_MINSIZE, weight=LEFT_COL_WEIGHT)
             self.body_paned.pane(self.right_host, minsize=RIGHT_COL_MINSIZE, weight=RIGHT_COL_WEIGHT)
@@ -594,6 +759,9 @@ class AppLayoutMixin:
             pass
         self._right_sash_init = False
         self.right_host.bind("<Configure>", self._on_right_host_configure)
+        self._bind_sash_slide(self.body_paned)
+        self._bind_sash_slide(self.right_host)
+        self.root.bind("<ButtonRelease-1>", self._on_sash_release, add="+")
         self._sash_after = self.root.after_idle(self._set_default_sash)
         self.root.bind("<Destroy>", self._cancel_idle_jobs, add="+")
 
@@ -601,7 +769,8 @@ class AppLayoutMixin:
         preview_body.columnconfigure(0, weight=1)
         preview_body.rowconfigure(0, weight=1)
 
-        self.notebook = ttk.Notebook(preview_body)
+        apply_preview_notebook_style()
+        self.notebook = ttk.Notebook(preview_body, style=PREVIEW_NOTEBOOK_STYLE)
         self.notebook.grid(row=0, column=0, sticky="nsew")
         self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
 
@@ -934,8 +1103,8 @@ class AppLayoutMixin:
         self.tess_normalize_btn.pack(side="left")
         bind_tooltip(
             self.tess_normalize_btn,
-            "Estimates a studio flatten, then sets Darks / Lights so the grade "
-            "is visible and editable. Does not wrap or tessellate.",
+            "Flattens studio lighting (bowl / ramp) so a 3×3 tile stays even. "
+            "Does not wrap or tessellate. Darks / Lights stay a separate grade.",
         )
         self.tess_normalize_reset = self._make_slider_reset(
             norm_row, self._reset_tess_normalize
@@ -1434,10 +1603,11 @@ class AppLayoutMixin:
         self._bind_readonly_combo(self.tess_mode_combo, self._on_tess_mode_combo)
         bind_tooltip(
             self.tess_mode_combo,
-            "Tile (Repeating Design): crop to whole repeats, resize to the tile, "
-            "and fill leftover edges from the pattern so it wraps. "
-            "Tessellation: Hilbert (crinkly) diffuse. Mesh: warp / grid stretch. "
-            "Detail mosaic: Voronoi fill by image detail.",
+            "Tile (Repeating Design): crop to whole repeats, fill leftover from "
+            "the motif, then inpaint the wrap seam with LaMa (when available) "
+            "so opposite edges are synthesized together instead of copying one "
+            "corner. Tessellation: Hilbert (crinkly) diffuse. Mesh: warp / grid "
+            "stretch. Detail mosaic: Voronoi fill by image detail.",
         )
 
         h_head = ttk.Frame(host)
@@ -1815,6 +1985,34 @@ class AppLayoutMixin:
                 pass
             self._cluster_job = None
 
+    def _bind_sash_slide(self, paned: tk.Misc) -> None:
+        """Track sash drags so preview refit / chrome lift wait until release."""
+        paned.bind("<ButtonPress-1>", lambda e, p=paned: self._on_sash_press(p, e), add="+")
+        paned.bind("<ButtonRelease-1>", self._on_sash_release, add="+")
+
+    def _on_sash_press(self, paned: tk.Misc, event) -> None:
+        """Start a live sash drag only when the pointer is on the gutter."""
+        try:
+            hit = str(paned.identify(event.x, event.y))
+        except (tk.TclError, AttributeError):
+            return
+        if "sash" not in hit.lower():
+            return
+        self._sash_live = True
+
+    def _on_sash_release(self, _event=None) -> None:
+        """After the sash, refit previews and restack chrome once."""
+        if not getattr(self, "_sash_live", False):
+            return
+        self._sash_live = False
+        for col in self._dock_columns():
+            try:
+                col._sync_layout()
+            except tk.TclError:
+                pass
+        self._schedule_preview_fit()
+        self._schedule_raise_chrome()
+
     def _set_default_sash(self) -> None:
         """Left column starts wider; right split is half / half."""
         try:
@@ -1878,6 +2076,8 @@ class AppLayoutMixin:
         Docked panes are true children of each column canvas, so
         ``winfo_containing`` / pack-in / ``contains_root`` still hit-test the
         pointer; combobox dropdowns live in another Toplevel — leave those alone.
+        After a click, ``event.widget`` is the focused control — pointer xy is
+        the source of truth.
         """
         if self._wheel_over_combobox_popdown(event):
             return None
@@ -1885,31 +2085,269 @@ class AppLayoutMixin:
             return "break"
         if self._on_tone_spin_wheel(event):
             return "break"
-        for x, y in self._wheel_event_xy(event):
-            col = None
-            for candidate in self._dock_columns():
-                if candidate.contains_root(x, y):
-                    col = candidate
-                    break
-            if col is None:
+        x, y = self._pointer_hit_xy(event)
+        col = self._column_at_pointer(x, y)
+        if col is None:
+            target = None
+            try:
+                target = self.root.winfo_containing(x, y)
+            except tk.TclError:
                 target = None
-                try:
-                    target = self.root.winfo_containing(x, y)
-                except tk.TclError:
-                    target = None
-                col = self._column_from_widget(target) if target is not None else None
-            if col is None:
-                widget = getattr(event, "widget", None)
-                if isinstance(widget, str):
-                    try:
-                        widget = self.root.nametowidget(widget)
-                    except (KeyError, tk.TclError):
-                        widget = None
-                if widget is not None and isinstance(widget, tk.Misc):
-                    col = self._column_from_widget(widget)
-            if col is not None:
-                return col._on_mousewheel(event)
+            if target is not None and not _is_pointer_overlay(target):
+                col = self._column_from_widget(target)
+        if col is None and not self._pointer_over_app(x, y):
+            widget = self._event_widget(event)
+            if widget is not None:
+                col = self._column_from_widget(widget)
+        if col is not None:
+            return col._on_mousewheel(event)
         return "break"
+
+    def _event_widget(self, event) -> tk.Misc | None:
+        widget = getattr(event, "widget", None)
+        if isinstance(widget, str):
+            try:
+                widget = self.root.nametowidget(widget)
+            except (KeyError, tk.TclError):
+                widget = None
+        return widget if isinstance(widget, tk.Misc) else None
+
+    def _pointer_hit_xy(self, event=None) -> tuple[int, int]:
+        """One screen point: OS cursor when it is over this app, else event coords."""
+        os_xy: tuple[int, int] | None = None
+        ev_xy: tuple[int, int] | None = None
+        try:
+            os_xy = (int(self.root.winfo_pointerx()), int(self.root.winfo_pointery()))
+        except tk.TclError:
+            pass
+        if event is not None:
+            try:
+                ev_xy = (int(event.x_root), int(event.y_root))
+            except (tk.TclError, AttributeError, TypeError, ValueError):
+                pass
+        if os_xy is not None and self._pointer_over_app(*os_xy):
+            return os_xy
+        if ev_xy is not None and self._pointer_over_app(*ev_xy):
+            return ev_xy
+        if os_xy is not None:
+            return os_xy
+        if ev_xy is not None:
+            return ev_xy
+        return 0, 0
+
+    def _pointer_over_app(self, x_root: int, y_root: int) -> bool:
+        """True when ``(x_root, y_root)`` is over the mapped window or a floater."""
+        x, y = int(x_root), int(y_root)
+        try:
+            if self.root.winfo_viewable() and _widget_contains_root(self.root, x, y):
+                return True
+        except tk.TclError:
+            pass
+        for col in self._dock_columns():
+            if col.contains_root(x, y):
+                return True
+        for lab in self._preview_image_labels():
+            if _widget_contains_root(lab, x, y):
+                return True
+        try:
+            for child in self.root.winfo_children():
+                if getattr(child, "_wp_tooltip", False):
+                    continue
+                try:
+                    if child.winfo_viewable() and _is_independent_toplevel(child):
+                        if _widget_contains_root(child, x, y):
+                            return True
+                except tk.TclError:
+                    continue
+        except tk.TclError:
+            pass
+        return False
+
+    def _column_at_pointer(self, x_root: int, y_root: int) -> ScrollColumn | None:
+        """Column under the pointer (sash-aware); falls back to ``contains_root``."""
+        hit = self._hit_column(int(x_root), int(y_root))
+        if hit is not None:
+            return hit[0]
+        for candidate in self._dock_columns():
+            if candidate.contains_root(int(x_root), int(y_root)):
+                return candidate
+        return None
+
+    def _pointer_drag_locks_hit(self) -> bool:
+        """True while a real drag owns the pointer (do not steal grab / hover)."""
+        if getattr(self, "_snap_moving", None) is not None:
+            return True
+        coverage = getattr(self, "coverage", None)
+        if coverage is not None and getattr(coverage, "_drag_div", None) is not None:
+            return True
+        for name in ("orig_zoom_host", "tex_zoom_host", "tile_zoom_host", "seam_zoom_host", "mock_zoom_host"):
+            host = getattr(self, name, None)
+            if host is not None and (getattr(host, "panning", False) or getattr(host, "moving_layer", False)):
+                return True
+        for knob in getattr(self, "_tone_knobs", ()) or ():
+            if getattr(knob, "_dragging", False):
+                return True
+        return False
+
+    def _release_stale_pointer_grab(self) -> None:
+        """Drop a leftover Tk grab after a click so the next hover can hit-test."""
+        if self._pointer_drag_locks_hit():
+            return
+        try:
+            grab = self.root.grab_current()
+        except tk.TclError:
+            return
+        if grab is None:
+            return
+        try:
+            grab.grab_release()
+        except tk.TclError:
+            pass
+
+    def _widget_at_pointer(self, event=None) -> tk.Misc | None:
+        """Widget under the cursor (geometry), never the focused control."""
+        x, y = self._pointer_hit_xy(event)
+        hit = widget_at_root(self.root, x, y)
+        if hit is not None and not _is_pointer_overlay(hit):
+            return hit
+        try:
+            containing = self.root.winfo_containing(x, y)
+        except tk.TclError:
+            containing = None
+        if containing is not None and not _is_pointer_overlay(containing):
+            return containing
+        return None
+
+    def _on_pointer_hover(self, event) -> None:
+        """Retarget hover after click/scroll: Enter/Leave often never fire on Windows."""
+        if getattr(self, "_closing", False):
+            return
+        try:
+            state = int(getattr(event, "state", 0) or 0)
+        except (TypeError, ValueError):
+            state = 0
+        if state & 0x0100:
+            return
+        try:
+            if self._pointer_drag_locks_hit():
+                return
+            if self._combobox_popdown_mapped():
+                return
+            hit = self._widget_at_pointer(event)
+            old = getattr(self, "_hover_hit", None)
+            if hit is old:
+                self._forward_hover_motion(hit, event)
+                return
+            self._leave_hover_widget(old, event)
+            self._hover_hit = hit
+            self._enter_hover_widget(hit, event)
+        except tk.TclError:
+            return
+
+    def _on_pointer_button_release(self, event) -> None:
+        self._release_stale_pointer_grab()
+
+        def _later() -> None:
+            if getattr(self, "_closing", False):
+                return
+            try:
+                self._on_pointer_hover(event)
+            except tk.TclError:
+                pass
+
+        try:
+            self.root.after_idle(_later)
+        except tk.TclError:
+            _later()
+
+    def _hover_tip_widget(self, widget: tk.Misc | None) -> tk.Misc | None:
+        current = widget
+        seen: set[str] = set()
+        while current is not None:
+            if hover_tip_of(current) is not None:
+                return current
+            try:
+                key = str(current)
+            except (tk.TclError, TypeError):
+                break
+            if key in seen:
+                break
+            seen.add(key)
+            current = getattr(current, "master", None)
+        return None
+
+    def _pointer_hover_event(self, event, widget: tk.Misc | None):
+        """Motion/Enter event whose coords are the OS pointer, not the focused widget."""
+        x, y = self._pointer_hit_xy(event)
+        return SimpleNamespace(
+            x_root=x,
+            y_root=y,
+            x=getattr(event, "x", 0),
+            y=getattr(event, "y", 0),
+            widget=widget if widget is not None else getattr(event, "widget", None),
+        )
+
+    def _enter_hover_widget(self, widget: tk.Misc | None, event) -> None:
+        if widget is None:
+            return
+        snap = self._pointer_hover_event(event, widget)
+        tip_widget = self._hover_tip_widget(widget)
+        if tip_widget is not None:
+            tip = hover_tip_of(tip_widget)
+            if tip is not None:
+                tip._on_enter(snap)
+        if self._widget_is_orig_eyedrop_surface(widget):
+            self._on_orig_eyedrop_move(snap)
+
+    def _leave_hover_widget(self, widget: tk.Misc | None, event) -> None:
+        snap = self._pointer_hover_event(event, widget)
+        tip_widget = self._hover_tip_widget(widget)
+        if tip_widget is not None:
+            tip = hover_tip_of(tip_widget)
+            if tip is not None:
+                tip._on_leave(snap)
+        if widget is not None and self._widget_is_orig_eyedrop_surface(widget):
+            self._maybe_hide_eyedrop_overlay()
+
+    def _forward_hover_motion(self, widget: tk.Misc | None, event) -> None:
+        if widget is None:
+            return
+        snap = self._pointer_hover_event(event, widget)
+        tip_widget = self._hover_tip_widget(widget)
+        if tip_widget is not None:
+            tip = hover_tip_of(tip_widget)
+            if tip is not None:
+                tip._on_motion(snap)
+        if self._widget_is_orig_eyedrop_surface(widget):
+            self._on_orig_eyedrop_move(snap)
+
+    def _widget_is_orig_eyedrop_surface(self, widget: tk.Misc | None) -> bool:
+        if widget is None:
+            return False
+        targets = tuple(
+            w
+            for w in (
+                getattr(self, "orig_host", None),
+                getattr(self, "orig_zoom_host", None),
+                getattr(self, "orig_label", None),
+                getattr(self, "_eyedrop_overlay", None),
+            )
+            if w is not None
+        )
+        current: tk.Misc | None = widget
+        seen: set[str] = set()
+        while current is not None:
+            if current in targets:
+                return True
+            try:
+                key = str(current)
+            except (tk.TclError, TypeError):
+                break
+            if key in seen:
+                break
+            seen.add(key)
+            current = getattr(current, "master", None)
+        return False
 
     def _on_tone_spin_wheel(self, event) -> str | None:
         """Focused Color & lighting spin: wheel ±1 when the pointer is over that row."""
@@ -1962,15 +2400,15 @@ class AppLayoutMixin:
         return "break"
 
     def _wheel_event_xy(self, event) -> list[tuple[int, int]]:
-        """Screen coords: event.x_root first (tests), then the OS pointer (Windows)."""
+        """Screen coords: OS pointer first (Windows focus is a lie), then event.x_root."""
         out: list[tuple[int, int]] = []
-        try:
-            out.append((int(event.x_root), int(event.y_root)))
-        except (tk.TclError, AttributeError, TypeError, ValueError):
-            pass
         try:
             out.append((int(self.root.winfo_pointerx()), int(self.root.winfo_pointery())))
         except tk.TclError:
+            pass
+        try:
+            out.append((int(event.x_root), int(event.y_root)))
+        except (tk.TclError, AttributeError, TypeError, ValueError):
             pass
         uniq: list[tuple[int, int]] = []
         for pair in out:
@@ -1990,9 +2428,13 @@ class AppLayoutMixin:
         if w is not None and isinstance(w, tk.Misc):
             widgets.append(w)
         try:
-            hit = self.root.winfo_containing(int(self.root.winfo_pointerx()), int(self.root.winfo_pointery()))
+            px, py = int(self.root.winfo_pointerx()), int(self.root.winfo_pointery())
+            hit = self.root.winfo_containing(px, py)
             if hit is not None:
                 widgets.append(hit)
+            geo = widget_at_root(self.root, px, py)
+            if geo is not None:
+                widgets.append(geo)
         except tk.TclError:
             pass
         for widget in widgets:
@@ -2136,8 +2578,8 @@ class AppLayoutMixin:
             (self.texture_panel, self.right_top_column),
             (self.tone_panel, self.right_top_column),
             (self.scale_panel, self.right_top_column),
-            (self.crop_panel, self.right_top_column),
             (self.layers_panel, self.right_bottom_column),
+            (self.crop_panel, self.right_bottom_column),
             (self.labels_panel, self.right_bottom_column),
             (self.tess_panel, self.right_bottom_column),
             (self.history_panel, self.right_bottom_column),
@@ -2499,9 +2941,18 @@ class AppLayoutMixin:
         right_bottom = [_title(t) for t in (spec.get("right_bottom") or [])]
         if not right_top and not right_bottom:
             combined = [_title(t) for t in (spec.get("right") or [])]
-            bottom_names = {"Layers", "Labels", "Tessellate", HISTORY_PANEL_TITLE}
+            bottom_names = {
+                "Layers",
+                CROP_PANEL_TITLE,
+                "Labels",
+                "Tessellate",
+                HISTORY_PANEL_TITLE,
+            }
             right_top = [t for t in combined if t not in bottom_names]
             right_bottom = [t for t in combined if t in bottom_names]
+            if CROP_PANEL_TITLE in right_bottom and "Layers" in right_bottom:
+                right_bottom = [t for t in right_bottom if t != CROP_PANEL_TITLE]
+                right_bottom.insert(right_bottom.index("Layers") + 1, CROP_PANEL_TITLE)
         hidden = {_title(t) for t in (spec.get("hidden") or [])}
         collapsed = {_title(t) for t in (spec.get("collapsed") or [])}
         _fill(left, self.left_column)

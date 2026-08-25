@@ -582,7 +582,7 @@ class AppLayersLabelsMixin:
             col._tag_column_widgets()
 
     def _pack_range_layer_row(self, row: tk.Misc, ly, bg: str) -> None:
-        """Eye (already packed) + match swatch / change swatch + coverage Spinbox."""
+        """Eye (already packed) + match / change swatches + coverage Spinbox + kebab."""
         index = int(ly.range_index)
         band = None
         if self.range_map is not None and 0 <= index < len(self.range_map.ranges):
@@ -591,6 +591,25 @@ class AppLayersLabelsMixin:
         repl_rgb = band.replacement_rgb if band is not None else (180, 180, 180)
         pct = int(round((band.weight if band is not None else 0.0) * 100.0))
         sel = index == int(self.selected_index)
+        n_ranges = len(self.range_map.ranges) if self.range_map is not None else 0
+        kebab = tk.Label(
+            row,
+            text=_LAYER_KEBAB,
+            bg=bg,
+            fg="#333333",
+            width=2,
+            cursor="hand2",
+        )
+        kebab.pack(side="right")
+        menu = tk.Menu(kebab, tearoff=0)
+        can_remove = n_ranges > 1
+        menu.add_command(
+            label="Remove",
+            command=lambda i=index: self._on_remove_layer_range(i),
+            state="normal" if can_remove else "disabled",
+        )
+        kebab.bind("<Button-1>", lambda e, i=index: self._on_range_kebab(e, i))
+        bind_tooltip(kebab, "More options for this color range.")
         match_cv = self._make_layer_swatch(
             row, match_rgb, index, HALF_MATCH, selected=sel and self.selected_half == HALF_MATCH
         )
@@ -639,6 +658,8 @@ class AppLayersLabelsMixin:
             "pct": var,
             "spin": spin,
             "row": row,
+            "kebab": kebab,
+            "menu": menu,
         }
 
     def _make_layer_swatch(
@@ -715,6 +736,63 @@ class AppLayersLabelsMixin:
         except ValueError:
             return
         self.apply_typed_percent(index, pct)
+
+    def _on_range_kebab(self, event, index: int) -> str:
+        """Post the range-row overflow menu at the ⋯ button."""
+        row = self._layer_range_rows.get(int(index))
+        if row is None:
+            return "break"
+        menu = row.get("menu")
+        if menu is None:
+            return "break"
+        widget = event.widget
+        try:
+            x = int(widget.winfo_rootx())
+            y = int(widget.winfo_rooty() + widget.winfo_height())
+        except tk.TclError:
+            x, y = int(event.x_root), int(event.y_root)
+        try:
+            menu.tk_popup(x, y)
+        finally:
+            try:
+                menu.grab_release()
+            except tk.TclError:
+                pass
+        return "break"
+
+    def _on_remove_layer_range(self, index: int) -> None:
+        """Delete a color range (not hide). Surviving match-from / change-to stay."""
+        if self._mute_ui or self._history_lock or self.range_map is None:
+            return
+        n = len(self.range_map.ranges)
+        if n <= 1:
+            return
+        index = max(0, min(int(index), n - 1))
+        before = self._capture_edit()
+        drop_color_range(self.range_map, index)
+        new_n = len(self.range_map.ranges)
+        if new_n >= n:
+            return
+        self.range_count.set(new_n)
+        sel = int(self.selected_index)
+        if sel < 0:
+            self.selected_index = -1
+        else:
+            if sel > index:
+                sel -= 1
+            self.selected_index = max(0, min(sel, new_n - 1))
+        self.status.set("Removed a color range — remaining match-from / change-to kept.")
+        preset = get_preset(self.preset_id) if self.preset_id else None
+        if preset is not None and preset.range_count != new_n:
+            self._clear_preset_selection()
+        self._push_undo_state(before)
+        self._sync_texture_to_map()
+        self._rebuild_chips()
+        self._load_selected_onto_wheel()
+        self._sync_range_widgets(update_bar=True)
+        self._sync_range_layers()
+        self._refresh_layers_panel()
+        self._refresh_now()
 
     def _sync_layer_range_rows(self) -> None:
         """Update swatches and % without rebuilding rows (keeps Spinbox focus)."""

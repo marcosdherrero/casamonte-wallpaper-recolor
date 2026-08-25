@@ -55,7 +55,7 @@ def main() -> int:
         "requirements.txt",
         "requirements-plot.txt",
         "Install.bat",
-        "WallpaperRecolor.bat",
+        "Run-LocalPython.bat",
     ):
         shutil.copy2(ROOT / name, STAGE / name)
 

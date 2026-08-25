@@ -60,6 +60,8 @@ SPLIT_LAB_A_EQUAL = "lab_a_equal"
 SPLIT_LAB_A_PIXELS = "lab_a_pixels"
 SPLIT_LAB_B_EQUAL = "lab_b_equal"
 SPLIT_LAB_B_PIXELS = "lab_b_pixels"
+SPLIT_LAB_C_EQUAL = "lab_c_equal"
+SPLIT_LAB_C_PIXELS = "lab_c_pixels"
 
 SPLIT_COLOR_CLOSENESS_LABEL = "Color closeness"
 SPLIT_EQUAL_LIGHTNESS_LABEL = "Equal lightness"
@@ -69,10 +71,13 @@ SPLIT_EQUAL_PIXELS_LABEL = "Even pixel split"
 RANGE_BY_COLOR_LABEL = "Color closeness"  # k-means / nearest Lab
 RANGE_BY_LUMA_LABEL = "Luma (Rec. 709)"  # light / mid / dark Rec. 709 bands
 RANGE_BY_LAB_L_LABEL = "L*"
-RANGE_BY_LAB_A_LABEL = "a*"
-RANGE_BY_LAB_B_LABEL = "b*"
+RANGE_BY_LAB_A_LABEL = "a* (green–red)"  # CIELAB a* opponent axis
+RANGE_BY_LAB_B_LABEL = "b* (blue–yellow)"  # CIELAB b* opponent axis
+RANGE_BY_LAB_C_LABEL = "C* (chroma)"  # C*ab = hypot(a*, b*) — 45° in the a*–b* plane
 
-# Lab-axis histogram splits → channel index in CIE Lab
+# Lab-axis histogram splits → channel index (3 = C* chroma, not a Lab slice)
+_LAB_C_CHANNEL = 3
+_CSTAR_MAX = 180.0  # CIE C*ab span for sRGB (0 = gray)
 _LAB_CHANNEL_FOR = {
     SPLIT_LAB_L_EQUAL: 0,
     SPLIT_LAB_L_PIXELS: 0,
@@ -80,6 +85,8 @@ _LAB_CHANNEL_FOR = {
     SPLIT_LAB_A_PIXELS: 1,
     SPLIT_LAB_B_EQUAL: 2,
     SPLIT_LAB_B_PIXELS: 2,
+    SPLIT_LAB_C_EQUAL: _LAB_C_CHANNEL,
+    SPLIT_LAB_C_PIXELS: _LAB_C_CHANNEL,
 }
 _PIXEL_BIN_METHODS = frozenset(
     {
@@ -87,6 +94,7 @@ _PIXEL_BIN_METHODS = frozenset(
         SPLIT_LAB_L_PIXELS,
         SPLIT_LAB_A_PIXELS,
         SPLIT_LAB_B_PIXELS,
+        SPLIT_LAB_C_PIXELS,
     }
 )
 ALLOWED_SPLIT_METHODS = frozenset(
@@ -100,8 +108,28 @@ ALLOWED_SPLIT_METHODS = frozenset(
         SPLIT_LAB_A_PIXELS,
         SPLIT_LAB_B_EQUAL,
         SPLIT_LAB_B_PIXELS,
+        SPLIT_LAB_C_EQUAL,
+        SPLIT_LAB_C_PIXELS,
     }
 )
+# Saved L* / "L split" jobs are Rec. 709 luma in the UI (duplicate of Range by Luma).
+_LUMA_SPLIT_ALIASES = {
+    "l_split": SPLIT_EQUAL_LIGHTNESS,
+    "l": SPLIT_EQUAL_LIGHTNESS,
+    "L": SPLIT_EQUAL_LIGHTNESS,
+    "L*": SPLIT_EQUAL_LIGHTNESS,
+    "l*": SPLIT_EQUAL_LIGHTNESS,
+    "lab_l": SPLIT_EQUAL_LIGHTNESS,
+    RANGE_BY_LAB_L_LABEL: SPLIT_EQUAL_LIGHTNESS,
+    SPLIT_LAB_L_EQUAL: SPLIT_EQUAL_LIGHTNESS,
+    SPLIT_LAB_L_PIXELS: SPLIT_EQUAL_PIXELS,
+}
+_CHROMA_SPLIT_ALIASES = {
+    "C*": SPLIT_LAB_C_EQUAL,
+    "c*": SPLIT_LAB_C_EQUAL,
+    "chroma": SPLIT_LAB_C_EQUAL,
+    RANGE_BY_LAB_C_LABEL: SPLIT_LAB_C_EQUAL,
+}
 
 # Color-closeness assignment: k-means from the scan (default) vs nearest palette hex
 ASSIGN_KMEANS = "kmeans"
@@ -150,13 +178,33 @@ def clamp_min_coverage(value: object) -> float:
     return max(0.0, min(MIN_COVERAGE_MAX, n))
 
 
+def canonicalize_split_method(method: str) -> str:
+    """Map legacy L* / l_split aliases onto Rec. 709 luma; keep known methods."""
+    key = str(method or "").strip()
+    if not key:
+        return SPLIT_COLOR_CLOSENESS
+    mapped = _LUMA_SPLIT_ALIASES.get(key)
+    if mapped is None:
+        mapped = _LUMA_SPLIT_ALIASES.get(key.lower())
+    if mapped is not None:
+        return mapped
+    chroma = _CHROMA_SPLIT_ALIASES.get(key)
+    if chroma is None:
+        chroma = _CHROMA_SPLIT_ALIASES.get(key.lower())
+    if chroma is not None:
+        return chroma
+    if key in ALLOWED_SPLIT_METHODS:
+        return key
+    return SPLIT_COLOR_CLOSENESS
+
+
 def is_color_split(method: str) -> bool:
     """True when ranges are nearest-Lab clusters, not 1D histogram bins."""
     return method == SPLIT_COLOR_CLOSENESS
 
 
 def is_lab_channel_split(method: str) -> bool:
-    """True when ranges are L* / a* / b* histogram bins (not Rec. 709 luma)."""
+    """True when ranges are L* / a* / b* / C* histogram bins (not Rec. 709 luma)."""
     return method in _LAB_CHANNEL_FOR
 
 
@@ -166,7 +214,7 @@ def is_pixel_bin_split(method: str) -> bool:
 
 
 def split_axis_channel(method: str) -> int | None:
-    """0=L*, 1=a*, 2=b* for Lab-axis bins; None for Rec. 709 luma or k-means."""
+    """0=L*, 1=a*, 2=b*, 3=C* for Lab-axis bins; None for Rec. 709 luma or k-means."""
     return _LAB_CHANNEL_FOR.get(method)
 
 
@@ -179,17 +227,33 @@ def split_axis_caption(method: str) -> str:
         return "a*"
     if ch == 2:
         return "b*"
+    if ch == _LAB_C_CHANNEL:
+        return "C*"
     return "L"
 
 
+def _lab_axis_values(lab: np.ndarray, method: str) -> np.ndarray:
+    """1D samples along L*, a*, b*, or C* = hypot(a*, b*) (45° in a*–b*)."""
+    ch = split_axis_channel(method)
+    if ch is None:
+        raise ValueError("not a Lab-axis split")
+    if int(ch) == _LAB_C_CHANNEL:
+        a = lab[..., 1].astype(np.float32, copy=False)
+        b = lab[..., 2].astype(np.float32, copy=False)
+        return np.hypot(a, b)
+    return lab[..., int(ch)]
+
+
 def bin_display_key(low: float, high: float, method: str) -> float:
-    """0–1 key for the coverage-bar gray (luma / L* / a* / b* mid-bin)."""
+    """0–1 key for the coverage-bar gray (luma / L* / a* / b* / C* mid-bin)."""
     mid = (float(low) + float(high)) * 0.5
     ch = split_axis_channel(method)
     if ch is None:
         return max(0.0, min(1.0, mid / 255.0))
     if ch == 0:
         return max(0.0, min(1.0, mid / 100.0))
+    if ch == _LAB_C_CHANNEL:
+        return max(0.0, min(1.0, mid / _CSTAR_MAX))
     return max(0.0, min(1.0, (mid + 128.0) / 255.0))
 
 
@@ -199,6 +263,8 @@ def _channel_span_defaults(method: str) -> tuple[float, float]:
         return (0.0, 255.0)
     if ch == 0:
         return (0.0, 100.0)
+    if ch == _LAB_C_CHANNEL:
+        return (0.0, _CSTAR_MAX)
     return (-128.0, 127.0)
 
 
@@ -922,7 +988,7 @@ def build_range_map(
     lab = None
     if is_lab_channel_split(split_method):
         lab = rgb_to_lab_array(rgb)
-        values = lab[..., int(split_axis_channel(split_method))]
+        values = _lab_axis_values(lab, split_method)
     else:
         values = luma_channel(rgb)
     edges = _bin_edges(values, range_count, split_method, valid, start=bin_start)
@@ -954,7 +1020,7 @@ def _histogram_channel(range_map: ColorRangeMap, rgb: np.ndarray) -> np.ndarray:
     if lab is None:
         lab = rgb_to_lab_array(rgb)
         range_map.lab = lab
-    return lab[..., int(ch)]
+    return _lab_axis_values(lab, range_map.split_method)
 
 
 def apply_weights(
@@ -1518,14 +1584,18 @@ def label_image(
     h, w_px = rgb.shape[:2]
     if h * w_px <= FULL_VECTOR_MAX_PIXELS:
         lab = rgb_to_lab_array(rgb)
-        labels = _label_pixels(lab[..., int(ch)], range_map.edges, valid)
+        labels = _label_pixels(_lab_axis_values(lab, range_map.split_method), range_map.edges, valid)
         return rgb, alpha, labels
     labels = np.full((h, w_px), -1, dtype=np.int32)
     strip = ASSIGN_STRIP_ROWS
     for y0 in range(0, h, strip):
         y1 = min(h, y0 + strip)
         block = rgb_to_lab_array(rgb[y0:y1])
-        labels[y0:y1] = _label_pixels(block[..., int(ch)], range_map.edges, valid[y0:y1])
+        labels[y0:y1] = _label_pixels(
+            _lab_axis_values(block, range_map.split_method),
+            range_map.edges,
+            valid[y0:y1],
+        )
     return rgb, alpha, labels
 
 

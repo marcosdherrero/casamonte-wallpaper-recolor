@@ -14,6 +14,11 @@ Fill order: LaMa ONNX (cached, never downloaded here) at native crop size
 padded to a multiple of 8 (no downscale) → cv2.inpaint NS → numpy
 period/Hilbert. Optional extras: ``pip install -r requirements-ocr.txt``.
 
+Tile Build also uses this stack on wrap seams: roll the motif so opposite
+edges meet in the middle, inpaint that plus-shaped band with LaMa (or
+period/Hilbert fallback), then roll back. That uses both sides of the
+repeat as context instead of copying one corner onto the other.
+
 Empty mask is identity. Preview and Save share ``inpaint_image``.
 
 Class references (code + name only):
@@ -31,7 +36,7 @@ from PIL import Image, ImageDraw
 
 from wallpaper_recolor.color.color_ranges import luma_channel
 from wallpaper_recolor.labels.boxes import aabb_quad
-from wallpaper_recolor.transform.lama_onnx import lama_inpaint_crop
+from wallpaper_recolor.transform.lama_onnx import lama_inpaint_crop, lama_inpaint_windows
 from wallpaper_recolor.transform.tessellate import estimate_axis_period, hilbert_xy_to_d
 
 Box = tuple[int, int, int, int]
@@ -53,6 +58,11 @@ _NEIGH = (
 _PAD_DEFAULT = 2
 _CROP_MARGIN = 16
 _CROP_MARGIN_MAX = 48
+_SEAM_MIN = 8
+_SEAM_MAX = 48
+_SEAM_CONTEXT = 96
+_LAMA_TILE = 512
+_LAMA_OVERLAP = 64
 _GLYPH_RING = 14
 _INK_DELTA = 14.0
 
@@ -311,6 +321,162 @@ def _fill_crop_backend(rgb: np.ndarray, hole: np.ndarray, *, wrap: bool, cancel=
         return filled
     _set_backend("numpy")
     return _pattern_fill(rgb, np.asarray(hole, dtype=bool), wrap=wrap, cancel=cancel)
+
+
+def _seam_band(span: int) -> int:
+    return max(_SEAM_MIN, min(_SEAM_MAX, int(round(int(span) / 16.0))))
+
+
+def wrap_seam_mask(height: int, width: int, *, wrap_h: bool, wrap_v: bool) -> np.ndarray:
+    """Plus-shaped hole at the rolled midlines (horizontal and/or vertical wrap)."""
+    h, w = max(1, int(height)), max(1, int(width))
+    mask = np.zeros((h, w), dtype=bool)
+    if wrap_h:
+        bw = _seam_band(w)
+        x0 = max(0, w // 2 - bw // 2)
+        mask[:, x0 : x0 + bw] = True
+    if wrap_v:
+        bh = _seam_band(h)
+        y0 = max(0, h // 2 - bh // 2)
+        mask[y0 : y0 + bh, :] = True
+    return mask
+
+
+def _seam_windows(
+    height: int,
+    width: int,
+    *,
+    wrap_h: bool,
+    wrap_v: bool,
+) -> list[tuple[int, int, int, int]]:
+    """Overlapping LaMa crops along the rolled wrap seams (not the full frame)."""
+    h, w = max(1, int(height)), max(1, int(width))
+    tile = _LAMA_TILE
+    overlap = _LAMA_OVERLAP
+    context = _SEAM_CONTEXT
+    windows: list[tuple[int, int, int, int]] = []
+
+    def _along(vertical: bool) -> None:
+        if vertical:
+            cx = w // 2
+            half = _seam_band(w) // 2 + context
+            x0 = max(0, cx - half)
+            x1 = min(w, cx + half)
+            if x1 - x0 > tile:
+                mid = (x0 + x1) // 2
+                x0 = max(0, mid - tile // 2)
+                x1 = min(w, x0 + tile)
+            y = 0
+            while y < h:
+                y1 = min(h, y + tile)
+                windows.append((y, x0, y1, x1))
+                if y1 >= h:
+                    break
+                nxt = y1 - overlap
+                if nxt <= y:
+                    break
+                y = nxt
+            return
+        cy = h // 2
+        half = _seam_band(h) // 2 + context
+        y0 = max(0, cy - half)
+        y1 = min(h, cy + half)
+        if y1 - y0 > tile:
+            mid = (y0 + y1) // 2
+            y0 = max(0, mid - tile // 2)
+            y1 = min(h, y0 + tile)
+        x = 0
+        while x < w:
+            x1 = min(w, x + tile)
+            windows.append((y0, x, y1, x1))
+            if x1 >= w:
+                break
+            nxt = x1 - overlap
+            if nxt <= x:
+                break
+            x = nxt
+
+    if wrap_h:
+        _along(True)
+    if wrap_v:
+        _along(False)
+    return windows
+
+
+def inpaint_wrap_seams(
+    arr: np.ndarray,
+    *,
+    wrap_h: bool,
+    wrap_v: bool,
+    cancel=None,
+) -> np.ndarray:
+    """Make opposite edges meet by inpainting them together in the rolled canvas.
+
+    Rolls the image so wrap edges sit at the midlines, fills a plus-shaped
+    seam with LaMa (then OpenCV, then period/Hilbert copies from this image),
+    and rolls back. Identity when both wraps are off or the frame is tiny.
+    """
+    _raise_if_cancelled(cancel)
+    src = np.asarray(arr)
+    if src.size == 0 or src.ndim < 2:
+        return np.array(src, copy=True)
+    if not wrap_h and not wrap_v:
+        return np.array(src, copy=True)
+    h, w = int(src.shape[0]), int(src.shape[1])
+    if h < 16 or w < 16:
+        return np.array(src, copy=True)
+    dy = h // 2 if wrap_v else 0
+    dx = w // 2 if wrap_h else 0
+    rolled = np.roll(np.roll(src, dy, axis=0), dx, axis=1)
+    hole = wrap_seam_mask(h, w, wrap_h=wrap_h, wrap_v=wrap_v)
+    if not np.any(hole):
+        return np.array(src, copy=True)
+    if rolled.ndim == 3 and rolled.shape[-1] >= 3:
+        rgb = np.ascontiguousarray(rolled[..., :3], dtype=np.uint8)
+        out = np.array(rolled, copy=True)
+        filled_rgb = _fill_wrap_seam_rgb(rgb, hole, wrap_h=wrap_h, wrap_v=wrap_v, cancel=cancel)
+        out[..., :3] = filled_rgb
+        return np.roll(np.roll(out, -dy, axis=0), -dx, axis=1)
+    filled = _pattern_fill(rolled, hole, wrap=True, cancel=cancel)
+    return np.roll(np.roll(filled, -dy, axis=0), -dx, axis=1)
+
+
+def _fill_wrap_seam_rgb(
+    rgb: np.ndarray,
+    hole: np.ndarray,
+    *,
+    wrap_h: bool,
+    wrap_v: bool,
+    cancel=None,
+) -> np.ndarray:
+    """LaMa along seam windows, then OpenCV, then wrap-aware period/Hilbert."""
+    _raise_if_cancelled(cancel)
+    left = np.asarray(hole, dtype=bool)
+    out = np.array(rgb, copy=True)
+    windows = _seam_windows(out.shape[0], out.shape[1], wrap_h=wrap_h, wrap_v=wrap_v)
+    lama, covered = lama_inpaint_windows(out, left, windows, overlap=_LAMA_OVERLAP)
+    if lama is not None and covered is not None:
+        _set_backend("lama")
+        out = np.where(covered[..., None], lama, out)
+        left = left & ~covered
+    if np.any(left):
+        for y0, x0, y1, x1 in windows:
+            _raise_if_cancelled(cancel)
+            sub = left[y0:y1, x0:x1]
+            if not np.any(sub):
+                continue
+            filled = _cv2_inpaint_crop(out[y0:y1, x0:x1], sub)
+            if filled is None:
+                continue
+            crop = np.array(out[y0:y1, x0:x1], copy=True)
+            crop[sub] = filled[sub]
+            out[y0:y1, x0:x1] = crop
+            left[y0:y1, x0:x1] = False
+            _set_backend("cv2")
+    if np.any(left):
+        _set_backend("numpy")
+        out = _pattern_fill(out, left, wrap=True, cancel=cancel)
+    return out
 
 
 def _map_boxes_to_image(

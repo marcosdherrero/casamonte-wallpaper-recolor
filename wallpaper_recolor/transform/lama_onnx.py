@@ -188,3 +188,68 @@ def lama_inpaint_crop(rgb: np.ndarray, mask: np.ndarray) -> np.ndarray | None:
         arr = np.transpose(arr, (1, 2, 0))
     arr = np.clip(np.rint(arr * 255.0), 0, 255).astype(np.uint8)
     return arr[:h, :w]
+
+
+def _taper_1d(length: int, left: int, right: int) -> np.ndarray:
+    """Linear fade at the ends so overlapping LaMa windows blend."""
+    n = max(1, int(length))
+    w = np.ones(n, dtype=np.float64)
+    left = max(0, min(int(left), n // 2))
+    right = max(0, min(int(right), n - left))
+    if left:
+        w[:left] = np.linspace(0.05, 1.0, left, endpoint=False)
+    if right:
+        w[n - right :] = np.linspace(1.0, 0.05, right, endpoint=False)
+    return w
+
+
+def lama_inpaint_windows(
+    rgb: np.ndarray,
+    mask: np.ndarray,
+    windows: list[tuple[int, int, int, int]],
+    *,
+    overlap: int = 64,
+) -> tuple[np.ndarray, np.ndarray] | tuple[None, None]:
+    """Fill ``mask`` by running LaMa on overlapping ``(y0, x0, y1, x1)`` crops.
+
+    Returns ``(rgb, filled_mask)`` or ``(None, None)`` when no window ran.
+    Only mask pixels with weight are written; seam context stays from ``rgb``.
+    """
+    hole = np.asarray(mask, dtype=bool)
+    if not np.any(hole) or not windows:
+        return None, None
+    src = np.ascontiguousarray(rgb[..., :3], dtype=np.uint8)
+    h, w = hole.shape
+    if src.shape[0] != h or src.shape[1] != w:
+        return None, None
+    acc = np.zeros((h, w, 3), dtype=np.float64)
+    wgt = np.zeros((h, w), dtype=np.float64)
+    ran = False
+    ov = max(0, int(overlap))
+    for y0, x0, y1, x1 in windows:
+        y0, x0, y1, x1 = int(y0), int(x0), int(y1), int(x1)
+        if y1 <= y0 or x1 <= x0:
+            continue
+        y0 = max(0, min(y0, h - 1))
+        x0 = max(0, min(x0, w - 1))
+        y1 = max(y0 + 1, min(y1, h))
+        x1 = max(x0 + 1, min(x1, w))
+        sub = hole[y0:y1, x0:x1]
+        if not np.any(sub):
+            continue
+        filled = lama_inpaint_crop(src[y0:y1, x0:x1], sub)
+        if filled is None:
+            continue
+        ran = True
+        wy = _taper_1d(y1 - y0, ov if y0 > 0 else 0, ov if y1 < h else 0)
+        wx = _taper_1d(x1 - x0, ov if x0 > 0 else 0, ov if x1 < w else 0)
+        ww = wy[:, None] * wx[None, :]
+        acc[y0:y1, x0:x1] += filled.astype(np.float64) * ww[..., None]
+        wgt[y0:y1, x0:x1] += ww
+    if not ran:
+        return None, None
+    out = np.array(src, copy=True)
+    ok = hole & (wgt > 1e-6)
+    blended = acc / np.maximum(wgt[..., None], 1e-6)
+    out[ok] = np.clip(np.rint(blended[ok]), 0, 255).astype(np.uint8)
+    return out, ok

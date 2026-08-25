@@ -33,6 +33,7 @@ from wallpaper_recolor.color.pantone import (
     pantone_code_for_rgb,
 )
 from wallpaper_recolor.ui.tooltip import bind_tooltip
+from wallpaper_recolor.ui.widgets import _bind_smooth_scale
 
 # Panel fill behind the wheel (htmlcolorcodes-style light page)
 WHEEL_BG = (245, 245, 245)
@@ -41,8 +42,9 @@ RING_INNER = 118  # gap between disk and lightness ring
 RING_OUTER = 148
 CANVAS_SIZE = 320  # square canvas in pixels
 HANDLE_R = 8  # white circle handles, same idea as htmlcolorcodes
-BAR_H = 22  # mix-bar canvas height (room for the black-dot thumb)
-THUMB_R = 6
+BAR_H = 14  # gradient strip above the mix sliders
+THUMB_R = 6  # Tailwind cell marker
+MIX_DEFAULTS = {"shades": 0.0, "tints": 1.0, "tones": 1.0}
 MIX_BLACK = (0, 0, 0)
 MIX_WHITE = (255, 255, 255)
 MIX_GRAY = (128, 128, 128)  # medium gray, htmlcolorcodes tones left end
@@ -61,6 +63,27 @@ UNKNOWN_PANTONE = "Unknown Pantone code"
 OPAQUE_ALPHA = 255  # recode pipeline is RGB; A is display-only, 255 = opaque
 PANTONE_SUGGEST_LIMIT = 16
 _COMPLETE_HEX = re.compile(r"^#[0-9A-Fa-f]{6}$")
+_NAV_KEYS = frozenset(
+    {
+        "Return",
+        "Escape",
+        "Up",
+        "Down",
+        "Left",
+        "Right",
+        "Tab",
+        "Home",
+        "End",
+        "Prior",
+        "Next",
+        "Shift_L",
+        "Shift_R",
+        "Control_L",
+        "Control_R",
+        "Alt_L",
+        "Alt_R",
+    }
+)
 _MIX_TIPS = {
     "tailwind": "Tailwind 50–900 steps of this hue and saturation.",
     "shades": "Mix toward black.",
@@ -261,10 +284,14 @@ class ColorWheel(ttk.Frame):
         self._mute_ui = False  # skip value commit while we write the field
         self._bar_drag: str | None = None  # "tailwind" | "shades" | "tints" | "tones"
         self._bar_base: tuple[int, int, int] | None = None  # frozen while a thumb is dragged
-        self._mix_t = {"shades": 0.0, "tints": 1.0, "tones": 1.0}  # thumbs at pure base
+        self._mix_t = dict(MIX_DEFAULTS)
         self._tailwind_index = 5  # 500
         self._mix_photos: dict[str, ImageTk.PhotoImage] = {}
         self._mix_bars: dict[str, tk.Canvas] = {}
+        self._mix_vars: dict[str, tk.DoubleVar] = {}
+        self._mix_scales: dict[str, ttk.Scale] = {}
+        self._mix_resets: dict[str, ttk.Button] = {}
+        self._mix_mute = False
         self._history: list[tuple[int, int, int]] = []
         self._alpha = OPAQUE_ALPHA  # UI-only; recode uses RGB
         self._pantone_popup: tk.Toplevel | None = None
@@ -331,6 +358,7 @@ class ColorWheel(ttk.Frame):
         self.pantone_entry.bind("<Escape>", self._on_pantone_escape)
         self.rgbao_entry.bind("<Return>", self._rgbao_committed)
         self.rgbao_entry.bind("<FocusOut>", self._rgbao_committed)
+        self.rgbao_entry.bind("<KeyRelease>", self._rgbao_keyrelease)
         self.bind("<Destroy>", self._on_destroy, add="+")
 
         self.hsl_label = ttk.Label(meta, text="")
@@ -349,6 +377,9 @@ class ColorWheel(ttk.Frame):
     def set_rgb(self, rgb: tuple[int, int, int], notify: bool = False) -> None:
         """Move the handles to ``rgb`` without a feedback loop unless ``notify``."""
         self._h, self._s, self._l = rgb_to_hsl(rgb)
+        if self._bar_drag is None:
+            self._bar_base = None
+            self._reset_mix_thumbs()
         self._redraw_wheel()
         self._sync_readouts()
         if notify:
@@ -471,6 +502,8 @@ class ColorWheel(ttk.Frame):
             self._s = min(dist / DISK_RADIUS, 1.0)
         elif self._drag == "ring":
             self._l = hue  # ring uses the same 0–1 angle as lightness
+        self._bar_base = None
+        self._reset_mix_thumbs()
         self._redraw_wheel()
         self._sync_readouts()
         self._emit()
@@ -499,7 +532,6 @@ class ColorWheel(ttk.Frame):
             )
         )
         if self._bar_drag is None:
-            self._reset_mix_thumbs()
             self._paint_mix_bars()
 
     # ---------------------------------------------------------------------------
@@ -599,7 +631,7 @@ class ColorWheel(ttk.Frame):
         self.history_title.set("History")
 
     def _build_mix_bars(self) -> None:
-        """Tailwind + Shades / Tints / Tones stacked under the history strip."""
+        """Tailwind chips plus Shades / Tints / Tones sliders under the history strip."""
         host = ttk.Frame(self)
         host.pack(fill="x", pady=(10, 0))
         for kind, title in (
@@ -608,35 +640,124 @@ class ColorWheel(ttk.Frame):
             ("tints", "Tints"),
             ("tones", "Tones"),
         ):
-            ttk.Label(host, text=title).pack(anchor="w", pady=(6, 1))
+            head = ttk.Frame(host)
+            head.pack(fill="x", pady=(6, 0))
+            ttk.Label(head, text=title).pack(side="left")
+            if kind != "tailwind":
+                reset = ttk.Button(
+                    head,
+                    text="Reset",
+                    width=6,
+                    command=lambda k=kind: self._reset_mix_slider(k),
+                )
+                self._mix_resets[kind] = reset
             bar = tk.Canvas(
                 host,
-                height=BAR_H,
+                height=BAR_H if kind != "tailwind" else 22,
                 highlightthickness=1,
                 highlightbackground="#c8c8c8",
-                cursor="hand2",
+                cursor="hand2" if kind == "tailwind" else "arrow",
                 bg="#e8e8e8",
             )
             bar.pack(fill="x")
-            bar.bind("<Button-1>", lambda e, k=kind: self._bar_press(k, e))
-            bar.bind("<B1-Motion>", lambda e, k=kind: self._bar_move(k, e))
-            bar.bind("<ButtonRelease-1>", lambda e, k=kind: self._bar_release(k, e))
             bar.bind("<Configure>", lambda e, k=kind: self._paint_mix_bar(k))
             bind_tooltip(bar, _MIX_TIPS[kind])
             self._mix_bars[kind] = bar
+            if kind == "tailwind":
+                bar.bind("<Button-1>", lambda e, k=kind: self._bar_press(k, e))
+                bar.bind("<B1-Motion>", lambda e, k=kind: self._bar_move(k, e))
+                bar.bind("<ButtonRelease-1>", lambda e, k=kind: self._bar_release(k, e))
+                continue
+            var = tk.DoubleVar(value=MIX_DEFAULTS[kind])
+            self._mix_vars[kind] = var
+            scale = ttk.Scale(
+                host,
+                from_=0.0,
+                to=1.0,
+                variable=var,
+                orient="horizontal",
+                command=lambda _v, k=kind: self._on_mix_scale(k),
+            )
+            scale.pack(fill="x", pady=(2, 0))
+            bind_tooltip(scale, _MIX_TIPS[kind])
+            _bind_smooth_scale(
+                scale,
+                var,
+                step=0.01,
+                from_=0.0,
+                to_=1.0,
+                on_begin=lambda _e=None, k=kind: self._mix_begin(k),
+                on_end=lambda _e=None, k=kind: self._mix_end(k),
+            )
+            self._mix_scales[kind] = scale
+        self._sync_mix_resets()
 
     def _mix_base(self) -> tuple[int, int, int]:
         return self._bar_base if self._bar_base is not None else self.current_rgb()
 
+    def _set_mix_t(self, kind: str, t: float) -> None:
+        t = 0.0 if t < 0.0 else 1.0 if t > 1.0 else float(t)
+        self._mix_t[kind] = t
+        var = self._mix_vars.get(kind)
+        if var is None:
+            return
+        self._mix_mute = True
+        try:
+            if abs(float(var.get()) - t) > 1e-6:
+                var.set(t)
+        except (tk.TclError, TypeError, ValueError):
+            var.set(t)
+        finally:
+            self._mix_mute = False
+
     def _reset_mix_thumbs(self) -> None:
-        """Park continuous thumbs on the pure-base end; snap Tailwind to nearest L."""
-        self._mix_t["shades"] = 0.0
-        self._mix_t["tints"] = 1.0
-        self._mix_t["tones"] = 1.0
+        """Park mix sliders on the pure-base end; snap Tailwind to nearest L."""
+        for kind, default in MIX_DEFAULTS.items():
+            self._set_mix_t(kind, default)
         self._tailwind_index = min(
             range(len(TAILWIND_LIGHTNESS)),
             key=lambda i: abs(TAILWIND_LIGHTNESS[i] - self._l),
         )
+        self._sync_mix_resets()
+
+    def _reset_mix_slider(self, kind: str) -> None:
+        """Return one mix slider to its base end and commit (no trough jump)."""
+        default = MIX_DEFAULTS[kind]
+        if self._bar_base is None:
+            self._bar_base = self.current_rgb()
+        self._bar_drag = kind
+        self.apply_mix(kind, default, commit=True)
+
+    def _sync_mix_resets(self) -> None:
+        for kind, btn in self._mix_resets.items():
+            default = MIX_DEFAULTS[kind]
+            show = abs(float(self._mix_t.get(kind, default)) - default) >= 0.02
+            mapped = str(btn.winfo_manager()) != ""
+            if show and not mapped:
+                btn.pack(side="left", padx=(8, 0))
+            elif not show and mapped:
+                btn.pack_forget()
+
+    def _mix_begin(self, kind: str) -> None:
+        self._bar_drag = kind
+        if self._bar_base is None:
+            self._bar_base = self.current_rgb()
+
+    def _mix_end(self, kind: str) -> None:
+        if self._bar_drag != kind and self._bar_drag is not None:
+            return
+        self._finish_bar()
+
+    def _on_mix_scale(self, kind: str) -> None:
+        if self._mix_mute or self._mute_ui:
+            return
+        try:
+            t = float(self._mix_vars[kind].get())
+        except (tk.TclError, TypeError, ValueError, KeyError):
+            return
+        if self._bar_base is None:
+            self._bar_base = self.current_rgb()
+        self.apply_mix(kind, t, commit=False)
 
     def _paint_mix_bars(self) -> None:
         for kind in self._mix_bars:
@@ -647,7 +768,7 @@ class ColorWheel(ttk.Frame):
         if bar is None:
             return
         width = max(int(bar.winfo_width()), 2)
-        height = BAR_H
+        height = int(bar.winfo_height()) or BAR_H
         base = self._mix_base()
         bar.delete("all")
         if kind == "tailwind":
@@ -655,30 +776,26 @@ class ColorWheel(ttk.Frame):
             n = len(TAILWIND_STOPS)
             cell = width / n
             tx = cell * (self._tailwind_index + 0.5)
+            cy = height / 2.0
+            bar.create_oval(
+                tx - THUMB_R,
+                cy - THUMB_R,
+                tx + THUMB_R,
+                cy + THUMB_R,
+                fill="#111111",
+                outline="#111111",
+                tags="thumb",
+            )
+            return
+        if kind == "shades":
+            left, right = base, MIX_BLACK
+        elif kind == "tints":
+            left, right = MIX_WHITE, base
         else:
-            if kind == "shades":
-                left, right = base, MIX_BLACK
-                t = self._mix_t["shades"]
-            elif kind == "tints":
-                left, right = MIX_WHITE, base
-                t = self._mix_t["tints"]
-            else:
-                left, right = MIX_GRAY, base
-                t = self._mix_t["tones"]
-            photo = self._gradient_photo(left, right, width, height)
-            self._mix_photos[kind] = photo
-            bar.create_image(0, 0, image=photo, anchor="nw")
-            tx = THUMB_R + t * max(width - 2 * THUMB_R, 1)
-        cy = height / 2.0
-        bar.create_oval(
-            tx - THUMB_R,
-            cy - THUMB_R,
-            tx + THUMB_R,
-            cy + THUMB_R,
-            fill="#111111",
-            outline="#111111",
-            tags="thumb",
-        )
+            left, right = MIX_GRAY, base
+        photo = self._gradient_photo(left, right, width, max(height, 2))
+        self._mix_photos[kind] = photo
+        bar.create_image(0, 0, image=photo, anchor="nw")
 
     def _paint_tailwind_cells(self, bar: tk.Canvas, width: int, height: int) -> None:
         h, s, _l = rgb_to_hsl(self._mix_base())
@@ -747,9 +864,11 @@ class ColorWheel(ttk.Frame):
             self.apply_tailwind_index(int(round(t * (len(TAILWIND_STOPS) - 1))), commit=commit)
             return
         self._mix_t[kind] = t
+        self._set_mix_t(kind, t)
         rgb = self._bar_color(kind, t)
         self._apply_from_bar(rgb)
         self._paint_mix_bar(kind)
+        self._sync_mix_resets()
         if commit:
             self._finish_bar()
 
@@ -793,12 +912,11 @@ class ColorWheel(ttk.Frame):
         self._finish_bar()
 
     def _finish_bar(self) -> None:
-        """One undo tick, then rebuild bars from the new base color."""
+        """One undo tick. Keep mix sliders where they are (Reset parks them)."""
         self._bar_drag = None
-        self._bar_base = None
         self._commit()
-        self._reset_mix_thumbs()
         self._paint_mix_bars()
+        self._sync_mix_resets()
 
     def _add_color_field(
         self, parent, row: int, name: str, var: tk.StringVar, width: int
@@ -828,17 +946,19 @@ class ColorWheel(ttk.Frame):
         if commit:
             self._commit()
 
-    def _hex_keyrelease(self, _event=None) -> None:
+    def _hex_keyrelease(self, event=None) -> None:
         """Apply a finished ``#RRGGBB`` while typing; leave partial strings alone."""
         if self._mute_ui:
+            return
+        if event is not None and getattr(event, "keysym", "") in _NAV_KEYS:
             return
         text = self.hex_var.get().strip()
         if not _COMPLETE_HEX.match(text):
             return
         parsed = hex_to_rgb(text)
-        if parsed is None:
+        if parsed is None or parsed == self.current_rgb():
             return
-        self._apply_typed_rgb(parsed, commit=False)
+        self._apply_typed_rgb(parsed, commit=True)
 
     def _hex_committed(self, _event=None) -> None:
         if self._mute_ui:
@@ -865,6 +985,20 @@ class ColorWheel(ttk.Frame):
             self._mute_ui = False
             return
         r, g, b, a = parsed
+        self._apply_typed_rgb((r, g, b), commit=True, alpha=a)
+
+    def _rgbao_keyrelease(self, event=None) -> None:
+        """Apply a finished r,g,b[,a] while typing; leave partial strings alone."""
+        if self._mute_ui:
+            return
+        if event is not None and getattr(event, "keysym", "") in _NAV_KEYS:
+            return
+        parsed = rgbao_text_to_rgba(self.rgbao_var.get())
+        if parsed is None:
+            return
+        r, g, b, a = parsed
+        if (r, g, b) == self.current_rgb() and int(a) == int(self._alpha):
+            return
         self._apply_typed_rgb((r, g, b), commit=True, alpha=a)
 
     def _pantone_committed(self, _event=None) -> None:
@@ -928,15 +1062,13 @@ class ColorWheel(ttk.Frame):
     def _pantone_keyrelease(self, event=None) -> None:
         if self._mute_ui:
             return
-        if event is not None and event.keysym in (
-            "Return",
-            "Escape",
-            "Up",
-            "Down",
-            "Tab",
-        ):
+        if event is not None and getattr(event, "keysym", "") in _NAV_KEYS:
             return
         self._update_pantone_popup(filter_pantone_codes(self.pantone_var.get()))
+        parsed = lookup_pantone_rgb(self.pantone_var.get())
+        if parsed is None or parsed == self.current_rgb():
+            return
+        self._apply_typed_rgb(parsed, commit=True)
 
     def _pantone_arrow_down(self, _event=None):
         if self._pantone_popup is None:

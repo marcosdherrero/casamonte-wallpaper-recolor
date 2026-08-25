@@ -22,11 +22,10 @@ import re
 
 from wallpaper_recolor.paths import user_data_dir
 from wallpaper_recolor.color.color_ranges import (
-    ALLOWED_SPLIT_METHODS,
     RANGE_BY_COLOR_LABEL,
     RANGE_BY_LAB_A_LABEL,
     RANGE_BY_LAB_B_LABEL,
-    RANGE_BY_LAB_L_LABEL,
+    RANGE_BY_LAB_C_LABEL,
     RANGE_BY_LUMA_LABEL,
     SPLIT_COLOR_CLOSENESS,
     SPLIT_COLOR_CLOSENESS_LABEL,
@@ -34,6 +33,7 @@ from wallpaper_recolor.color.color_ranges import (
     SPLIT_EQUAL_PIXELS_LABEL,
     ColorRangeMap,
     apply_weights,
+    canonicalize_split_method,
     is_color_split,
     is_pixel_bin_split,
     split_axis_channel,
@@ -121,15 +121,16 @@ class PalettePreset:
 
 def range_by_label_for(method: str) -> str:
     """Primary Range by: dropdown from a ColorRangeMap split_method."""
+    method = canonicalize_split_method(method)
     if is_color_split(method):
         return RANGE_BY_COLOR_LABEL
     ch = split_axis_channel(method)
-    if ch == 0:
-        return RANGE_BY_LAB_L_LABEL
     if ch == 1:
         return RANGE_BY_LAB_A_LABEL
     if ch == 2:
         return RANGE_BY_LAB_B_LABEL
+    if ch == 3:
+        return RANGE_BY_LAB_C_LABEL
     return RANGE_BY_LUMA_LABEL
 
 
@@ -474,9 +475,7 @@ def _preset_from_json(raw: object) -> PalettePreset | None:
             except (TypeError, ValueError):
                 match_rgb = None
         bands.append(PaletteBand(str(item.get("name") or ""), rgb, match_rgb=match_rgb))
-    split = str(raw.get("split_method") or SPLIT_COLOR_CLOSENESS)
-    if split not in ALLOWED_SPLIT_METHODS:
-        split = SPLIT_COLOR_CLOSENESS
+    split = canonicalize_split_method(raw.get("split_method") or SPLIT_COLOR_CLOSENESS)
     weights = None
     weights_raw = raw.get("weights")
     if isinstance(weights_raw, list) and len(weights_raw) == len(bands):

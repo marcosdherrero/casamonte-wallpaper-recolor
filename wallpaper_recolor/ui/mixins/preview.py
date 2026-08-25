@@ -107,6 +107,7 @@ from wallpaper_recolor.transform.tessellate import (
     TILES_MAX,
     TILES_MIN,
     apply_crop_lighting_tessellate,
+    apply_normalize_lighting,
     apply_tessellate,
     clamp_lloyd,
     clamp_tiles,
@@ -128,6 +129,7 @@ from wallpaper_recolor.transform.inpaint import (
 )
 from wallpaper_recolor.transform.lama_onnx import lama_onnx_available
 from wallpaper_recolor.io.image_io import OPEN_FILETYPES, SAVE_FILETYPES, load_image, save_image
+from wallpaper_recolor.io.proof import apply_icc
 from wallpaper_recolor.labels.boxes import (
     box_contains,
     display_box_to_source,
@@ -243,11 +245,13 @@ from wallpaper_recolor.ui.icons import (
 from wallpaper_recolor.ui.preview_fit import (
     PreviewZoomHost,
     _format_zoom_text,
+    _is_pointer_overlay,
     _preview_base_size,
     _scale_view_zoom,
     _view_zoom_size,
     _wheel_zoom_pct_delta,
     _widget_contains_root,
+    widget_at_root,
     clamp_view_zoom_pct,
     contain_size,
     fit_max_edge,
@@ -276,6 +280,14 @@ from wallpaper_recolor.ui.snapshot import (
     _json_rgb,
     default_layout_profiles_path,
 )
+
+
+def _preview_apply_icc(image: Image.Image, icc_path) -> Image.Image:
+    """Convert a preview frame; leave pixels unchanged if the profile fails."""
+    try:
+        return apply_icc(image, icc_path)
+    except ValueError:
+        return image
 
 
 class AppPreviewMixin:
@@ -352,6 +364,8 @@ class AppPreviewMixin:
 
     def _on_preview_fit_configure(self, event) -> None:
         if getattr(event, "widget", None) not in self._preview_zoom_hosts():
+            return
+        if getattr(self, "_sash_live", False):
             return
         self._schedule_preview_fit()
 
@@ -525,35 +539,67 @@ class AppPreviewMixin:
             current = getattr(current, "master", None)
         return False
 
+    def _point_over_preview_image(self, x_root: int, y_root: int) -> bool:
+        """True when screen point ``(x_root, y_root)`` is on a preview photo."""
+        x, y = int(x_root), int(y_root)
+        for lab in self._preview_image_labels():
+            if _widget_contains_root(lab, x, y):
+                return True
+        geo = widget_at_root(self.root, x, y)
+        return geo is not None and self._widget_is_preview_image(geo)
+
     def _pointer_over_preview_image(self, event) -> bool:
-        """True when the pointer is over Original / Result / tile / seam / mock photo."""
+        """True when the pointer is over Original / Result / tile / seam / mock photo.
+
+        After a click, Windows MouseWheel ``event.widget`` is the *focused*
+        control. Geometry under the cursor wins whenever the pointer is over
+        this app; ``event.widget`` is only a fallback for tests / off-window.
+        """
+        over_app = False
+        for x, y in self._wheel_event_xy(event):
+            if self._point_over_preview_image(x, y):
+                return True
+            if self._pointer_over_app(x, y):
+                over_app = True
+                geo = widget_at_root(self.root, x, y)
+                if geo is not None:
+                    return self._widget_is_preview_image(geo)
+                try:
+                    hit = self.root.winfo_containing(x, y)
+                except tk.TclError:
+                    hit = None
+                if hit is not None and not _is_pointer_overlay(hit):
+                    return self._widget_is_preview_image(hit)
+                return False
+        if over_app:
+            return False
         w = getattr(event, "widget", None)
         if isinstance(w, str):
             try:
                 w = self.root.nametowidget(w)
             except (KeyError, tk.TclError):
                 w = None
-        if w is not None and isinstance(w, tk.Misc) and self._widget_is_preview_image(w):
-            return True
-        for x, y in self._wheel_event_xy(event):
-            for lab in self._preview_image_labels():
-                if _widget_contains_root(lab, x, y):
-                    return True
-            try:
-                hit = self.root.winfo_containing(x, y)
-            except tk.TclError:
-                hit = None
-            if hit is not None and self._widget_is_preview_image(hit):
-                return True
-        return False
+        return w is not None and isinstance(w, tk.Misc) and self._widget_is_preview_image(w)
 
     def _pointer_over_clusters(self, event) -> bool:
         plot = getattr(self, "cluster_plot", None)
         if plot is None or not self._clusters_tab_selected():
             return False
+        over_app = False
         for x, y in self._wheel_event_xy(event):
             if plot.contains_root(x, y):
                 return True
+            if self._pointer_over_app(x, y):
+                over_app = True
+                geo = widget_at_root(self.root, x, y)
+                current = geo
+                while current is not None:
+                    if current is plot:
+                        return True
+                    current = getattr(current, "master", None)
+                return False
+        if over_app:
+            return False
         w = getattr(event, "widget", None)
         if isinstance(w, str):
             try:
@@ -959,6 +1005,8 @@ class AppPreviewMixin:
         """Original click samples while a match-from / change-to swatch can receive it."""
         if self._label_mark_mode or self._label_place_mode:
             return False
+        if self._grab_move_on():
+            return False
         return self.range_map is not None
 
     def _on_eyedrop_button(self) -> None:
@@ -988,6 +1036,16 @@ class AppPreviewMixin:
 
     def _sync_eyedrop_cursor(self) -> None:
         """Hide the system cursor on Original; the FA dropper overlay follows the pointer."""
+        if self._grab_move_on():
+            self._hide_eyedrop_overlay()
+            self._set_eyedrop_widget_cursor("hand2")
+            host = getattr(self, "orig_zoom_host", None)
+            if host is not None:
+                try:
+                    host._sync_host_cursor()
+                except tk.TclError:
+                    pass
+            return
         if not self._eyedrop_enabled():
             self._set_eyedrop_widget_cursor("")
             self._hide_eyedrop_overlay()
@@ -1268,13 +1326,18 @@ class AppPreviewMixin:
         except tk.TclError:
             return False
 
-    def _schedule_cluster_view(self) -> None:
+    def _cancel_cluster_job(self) -> None:
         job = getattr(self, "_cluster_job", None)
-        if job is not None:
-            try:
-                self.root.after_cancel(job)
-            except tk.TclError:
-                pass
+        if job is None:
+            return
+        try:
+            self.root.after_cancel(job)
+        except tk.TclError:
+            pass
+        self._cluster_job = None
+
+    def _schedule_cluster_view(self) -> None:
+        self._cancel_cluster_job()
         if not hasattr(self, "root"):
             return
         try:
@@ -1282,10 +1345,12 @@ class AppPreviewMixin:
         except tk.TclError:
             self._cluster_job = None
 
-    def _flush_cluster_view(self) -> None:
+    def _flush_cluster_view(self, *, force: bool = False) -> None:
         self._cluster_job = None
         plot = getattr(self, "cluster_plot", None)
-        if plot is None or not self._clusters_tab_selected():
+        if plot is None:
+            return
+        if not force and not self._clusters_tab_selected():
             return
         if self.range_map is None:
             plot.set_data(None)
@@ -1295,13 +1360,18 @@ class AppPreviewMixin:
             self.work_image,
             mode=plot.mode_key(),
         )
-        plot.set_data(data)
+        plot.set_data(data, force=force)
+
+    def _refresh_cluster_view_now(self) -> None:
+        """Redraw Lab scatter from the current range map — do not wait for preview."""
+        self._cancel_cluster_job()
+        self._flush_cluster_view(force=True)
 
     def _refresh_now(self) -> None:
         """Immediate preview (open / rebuild / reset — not a drag)."""
         self._cancel_preview_job()
+        self._refresh_cluster_view_now()
         self._refresh_previews()
-        self._schedule_cluster_view()
 
     def _select_composite_preview_tab(self) -> None:
         """First open / reset: Composite, not Clusters."""
@@ -1400,6 +1470,7 @@ class AppPreviewMixin:
             "tess": self._tess_params(),
             "tiles": self._tess_tiles_value(),
             "lloyd": self._tess_lloyd_value(),
+            "normalize": self._tess_normalize_on(),
             "tone": self._tone_apply_kwargs(),
             "detect_boxes": list(self._detect_boxes),
             "selected_detect": self._selected_detect,
@@ -1408,6 +1479,7 @@ class AppPreviewMixin:
             "stack": self.layer_stack,
             "selected_ids": tuple(self.layer_stack.selected_ids),
             "grain": self._save_uses_grain(),
+            "icc_path": self.icc_path,
         }
 
     def _preview_pils(self, snap: dict) -> tuple[Image.Image, Image.Image, Image.Image]:
@@ -1483,6 +1555,8 @@ class AppPreviewMixin:
                     )
                 img = apply_crop(img, cx, cy, cz, src_size=crop_src)
                 if selected:
+                    if snap.get("normalize"):
+                        img = apply_normalize_lighting(img)
                     img = apply_tessellate(
                         img,
                         h_side,
@@ -1508,6 +1582,8 @@ class AppPreviewMixin:
                         cancel=cancel,
                     )
                 if selected:
+                    if snap.get("normalize"):
+                        img = apply_normalize_lighting(img)
                     img = apply_tessellate(
                         img,
                         h_side,
@@ -1560,6 +1636,11 @@ class AppPreviewMixin:
             orig_disp = orig_disp.resize(orig.size, Image.Resampling.NEAREST)
         if live_preview.size != orig.size:
             live_preview = live_preview.resize(orig.size, Image.Resampling.NEAREST)
+        icc_path = snap.get("icc_path")
+        if icc_path:
+            orig_disp = _preview_apply_icc(orig_disp, icc_path)
+            live_preview = _preview_apply_icc(live_preview, icc_path)
+            live = _preview_apply_icc(live, icc_path)
         return orig_disp, live_preview, live
 
     def _apply_preview_pils(

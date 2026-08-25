@@ -32,11 +32,13 @@ CLUSTER_MAX_POINTS = 6000  # subsample; never scatter a 12k wallpaper on the Tk 
 CLUSTER_SEED = 7  # stable subsample so the cloud does not jump between refreshes
 MODE_SOURCE = "source"
 MODE_REPLACE = "replace"
-MODE_LABELS = ("Source RGB", "Change-to")
-MODE_KEYS = (MODE_SOURCE, MODE_REPLACE)
+MODE_LABEL_SOURCE = "Source RGB"
+MODE_LABEL_REPLACE = "Change-to"
+MODE_LABELS = (MODE_LABEL_REPLACE, MODE_LABEL_SOURCE)
+MODE_KEYS = (MODE_REPLACE, MODE_SOURCE)
 CLUSTER_HINT = (
     "Drag to orbit COM · Wheel zooms in on the cloud · Shift-drag / right-drag to pan · "
-    "Double-click a point to sample its color · Middle-drag moves the selected color in Lab · "
+    "Double-click a point to sample its color · Middle-drag moves the selected color · "
     "Cube: face/edge/corner · Center: iso + fit on mass · "
     "XYZ cycles Front/Right/Back/Left/Top/Bottom"
 )
@@ -75,12 +77,12 @@ FACE_VIEWS: dict[str, tuple[float, float]] = {
     "bottom": (-90.0, -90.0),  # −L*
 }
 FACE_LABELS = {
-    "front": "+a*",
-    "back": "−a*",
-    "right": "+b*",
-    "left": "−b*",
-    "top": "+L*",
-    "bottom": "−L*",
+    "front": "Front",
+    "back": "Back",
+    "right": "Right",
+    "left": "Left",
+    "top": "Top",
+    "bottom": "Bottom",
 }
 # Outward normals in (a*, b*, L*) = (x, y, z)
 FACE_NORMALS = {
@@ -310,7 +312,7 @@ def cluster_scatter_data(
     range_map: ColorRangeMap,
     work: Image.Image | None,
     *,
-    mode: str = MODE_SOURCE,
+    mode: str = MODE_REPLACE,
     max_points: int = CLUSTER_MAX_POINTS,
 ) -> dict | None:
     """Build the scatter payload from the current range map + work RGB."""
@@ -359,6 +361,7 @@ def cluster_scatter_data(
         "match_rgb": matches,
         "replace_rgb": replaces,
         "mode": MODE_REPLACE if use_replace else MODE_SOURCE,
+        "split_method": str(getattr(range_map, "split_method", "") or ""),
         "extents": cluster_range_extents(lab, lbl, matches, centers_lab),
     }
 
@@ -686,7 +689,7 @@ class ClusterPlot(ttk.Frame):
 
     def __init__(self, parent: tk.Misc) -> None:
         super().__init__(parent, padding=4)
-        self._mode = tk.StringVar(value=MODE_LABELS[0])
+        self._mode = tk.StringVar(value=MODE_LABEL_REPLACE)
         self._status = tk.StringVar(value="")
         self.on_pick = None  # (rgb, y, x) -> None
         self.on_zoom = None  # (pct: float) -> None
@@ -744,10 +747,10 @@ class ClusterPlot(ttk.Frame):
         self.bind("<Destroy>", self._on_destroy, add="+")
 
     def mode_key(self) -> str:
-        label = str(self._mode.get() or MODE_LABELS[0])
-        if label == MODE_LABELS[1]:
-            return MODE_REPLACE
-        return MODE_SOURCE
+        label = str(self._mode.get() or MODE_LABEL_REPLACE)
+        if label == MODE_LABEL_SOURCE:
+            return MODE_SOURCE
+        return MODE_REPLACE
 
     def zoom_pct(self) -> float:
         return float(self._zoom_pct)
@@ -791,11 +794,15 @@ class ClusterPlot(ttk.Frame):
 
     def contains_root(self, x_root: int, y_root: int) -> bool:
         try:
+            if not self.winfo_viewable():
+                return False
             x0 = int(self.winfo_rootx())
             y0 = int(self.winfo_rooty())
-            w = max(1, int(self.winfo_width()))
-            h = max(1, int(self.winfo_height()))
+            w = int(self.winfo_width())
+            h = int(self.winfo_height())
         except tk.TclError:
+            return False
+        if w <= 0 or h <= 0:
             return False
         return x0 <= int(x_root) < x0 + w and y0 <= int(y_root) < y0 + h
 
@@ -914,11 +921,14 @@ class ClusterPlot(ttk.Frame):
 
             self._fig = Figure(figsize=(5.2, 4.2), dpi=100)
             self._ax = self._fig.add_subplot(111, projection="3d")
+            self._ax.set_xlabel("")
+            self._ax.set_ylabel("")
+            self._ax.set_zlabel("")
             self._fig.subplots_adjust(left=0.02, right=0.98, top=0.96, bottom=0.04)
             self._mpl_widget = FigureCanvasTkAgg(self._fig, master=self.host)
             self._canvas = self._mpl_widget.get_tk_widget()
             self._canvas.grid(row=0, column=0, sticky="nsew")
-            self._status.set("CIE Lab · trackball orbit")
+            self._status.set("Trackball orbit")
             self._bind_orbit_widget(self._canvas)
             try:
                 self._ax.disable_mouse_rotation()
@@ -929,7 +939,7 @@ class ClusterPlot(ttk.Frame):
             self._ab_canvas.grid(row=0, column=0, sticky="nsew")
             self._ab_canvas.bind("<Configure>", lambda _e: self._redraw_ab(None))
             self._bind_orbit_widget(self._ab_canvas)
-            self._status.set("CIE Lab a*–b* · pip install -r requirements-plot.txt for 3D")
+            self._status.set("2D view · pip install -r requirements-plot.txt for 3D")
         self._cached_data = None
 
     def _build_view_overlay(self) -> None:
@@ -1074,9 +1084,9 @@ class ClusterPlot(ttk.Frame):
         self._clear_pick_highlight()
         if self._ax is not None:
             self._ax.clear()
-            self._ax.set_xlabel("a*")
-            self._ax.set_ylabel("b*")
-            self._ax.set_zlabel("L*")
+            self._ax.set_xlabel("")
+            self._ax.set_ylabel("")
+            self._ax.set_zlabel("")
             if self._mpl_widget is not None:
                 self._mpl_widget.draw_idle()
         if self._ab_canvas is not None:
@@ -1087,12 +1097,14 @@ class ClusterPlot(ttk.Frame):
         if data is None:
             self.clear()
             return
+        lbl = data["labels"]
         key = (
             data["lab"].shape,
             data["mode"],
             tuple(data["match_rgb"]),
             tuple(data["replace_rgb"]),
-            int(data["labels"].sum()) if data["labels"].size else 0,
+            str(data.get("split_method") or ""),
+            hash(lbl.tobytes()) if lbl.size else 0,
             int(data["point_rgb"].sum()) if data["point_rgb"].size else 0,
         )
         first = self._cached_data is None
@@ -1144,9 +1156,9 @@ class ClusterPlot(ttk.Frame):
                 linewidths=1.4,
                 depthshade=False,
             )
-        ax.set_xlabel("a*")
-        ax.set_ylabel("b*")
-        ax.set_zlabel("L*")
+        ax.set_xlabel("")
+        ax.set_ylabel("")
+        ax.set_zlabel("")
         self._apply_camera()
         self._draw_pick_highlight()
         self._mpl_widget.draw_idle()
@@ -1284,7 +1296,7 @@ class ClusterPlot(ttk.Frame):
     def _on_mmb_press(self, event) -> str | None:
         start = self._selected_start_lab()
         if start is None:
-            self._status.set("Select a range half, then middle-drag to move it in Lab")
+            self._status.set("Select a range half, then middle-drag to move it")
             return "break"
         self._move_lab = start
         self._mmb_last = (int(event.x_root), int(event.y_root))
@@ -1396,7 +1408,7 @@ class ClusterPlot(ttk.Frame):
         canvas.create_rectangle(0, 0, w, h, fill="#1e1e1e", outline="")
         if payload is None or payload["lab"].shape[0] == 0:
             canvas.create_text(
-                w // 2, h // 2, text="Open an image to plot Lab clusters.", fill="#888888"
+                w // 2, h // 2, text="Open an image to plot clusters.", fill="#888888"
             )
             return
         lab = payload["lab"]
@@ -1430,6 +1442,4 @@ class ClusterPlot(ttk.Frame):
             fill = f"#{match[0]:02x}{match[1]:02x}{match[2]:02x}"
             edge = f"#{repl[0]:02x}{repl[1]:02x}{repl[2]:02x}"
             canvas.create_rectangle(px - 5, py - 5, px + 5, py + 5, fill=fill, outline=edge, width=2)
-        canvas.create_text(pad, h - 6, text="a*", fill="#aaaaaa", anchor="sw")
-        canvas.create_text(w - 6, pad, text="b*", fill="#aaaaaa", anchor="ne")
         self._draw_pick_highlight()

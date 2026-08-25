@@ -12,6 +12,7 @@ Where to look
 - preview: Fit/contain, checker blit, eyedrop, Clusters glue
 - ranges: coverage %, presets, hide-eye knockout
 - adjust: Color & lighting, texture, Position & Zoom, scale, tessellate
+- swatch: room photo with a Pantone chip → Temperature / Tint / Exposure
 - layers_labels: Layers tree, Labels / OCR
 - session: open/export/job pack, ``.wpedit``, undo
 
@@ -255,6 +256,10 @@ from wallpaper_recolor.ui.icons import (
     _zoom_icon_photos,
 )
 from wallpaper_recolor.ui.preview_fit import (
+    HIT_NONE,
+    HIT_PREVIEW,
+    HIT_SIDEBAR,
+    HIT_SLIDER,
     PreviewZoomHost,
     _format_zoom_text,
     _preview_base_size,
@@ -262,6 +267,8 @@ from wallpaper_recolor.ui.preview_fit import (
     _view_zoom_size,
     _wheel_zoom_pct_delta,
     _widget_contains_root,
+    classify_pointer_hit,
+    widget_at_root,
     clamp_view_zoom_pct,
     contain_size,
     fit_max_edge,
@@ -303,6 +310,7 @@ from wallpaper_recolor.ui.mixins.layout import AppLayoutMixin
 from wallpaper_recolor.ui.mixins.preview import AppPreviewMixin
 from wallpaper_recolor.ui.mixins.ranges import AppRangesMixin
 from wallpaper_recolor.ui.mixins.session import AppSessionMixin
+from wallpaper_recolor.ui.mixins.swatch import AppSwatchMixin
 
 # Re-export names tests import from wallpaper_recolor.ui.app
 from wallpaper_recolor.io.export_layers_zip import export_layers_zip as write_layers_zip  # noqa: F401
@@ -314,6 +322,7 @@ class WallpaperRecolorApp(
     AppLayersLabelsMixin,
     AppPreviewMixin,
     AppAdjustMixin,
+    AppSwatchMixin,
     AppRangesMixin,
     AppSessionMixin,
 ):
@@ -338,6 +347,8 @@ class WallpaperRecolorApp(
         self._scratch_rgb: tuple[int, int, int] = (255, 0, 0)
         self.preset_id: str | None = None
         self.icc_path: Path | None = None
+        self.icc_choice = tk.StringVar(value="")
+        self._icc_profiles_dir_override: Path | None = None
         self._orig_photo: ImageTk.PhotoImage | None = None
         self._orig_pil: Image.Image | None = None
         self._tex_photo: ImageTk.PhotoImage | None = None
@@ -351,6 +362,7 @@ class WallpaperRecolorApp(
         self._layer_rows: list[tk.Misc] = []
         self._layer_range_rows: dict[int, dict] = {}
         self._layer_pct_mute = False
+        self._range_count_busy = False
         self._fit_job: str | None = None  # after() id while the preview pane resizes
         self._fit_panes_applied: tuple[tuple[int, int], ...] | None = None
         self._preview_pan_x = 0
@@ -388,6 +400,7 @@ class WallpaperRecolorApp(
         self._layout_profile_name: str | None = None
         self._layout_profiles_path = default_layout_profiles_path()
         self._edit_state_path: Path | None = None
+        self._saved_session_state: object | None = None
 
         self.range_count = tk.IntVar(value=DEFAULT_RANGES)
         self.range_by = tk.StringVar(value=RANGE_BY_COLOR_LABEL)  # Color closeness default
@@ -499,6 +512,7 @@ class WallpaperRecolorApp(
 
         # layout mixin: paned columns, dock, Composite/Clusters notebook
         self._build_layout()
+        self._build_swatch_controls()
         self._apply_job_layout_defaults()
         self.root.bind("<Control-o>", lambda _e: self.open_image())
         self.root.bind("<Control-s>", lambda _e: self.save_image_as())
@@ -527,6 +541,9 @@ class WallpaperRecolorApp(
         self.left_column._bind_column_wheel_widgets()
         self.right_top_column._bind_column_wheel_widgets()
         self.right_bottom_column._bind_column_wheel_widgets()
+        self._hover_hit = None
+        self.root.bind_all("<Motion>", self._on_pointer_hover, add="+")
+        self.root.bind_all("<ButtonRelease-1>", self._on_pointer_button_release, add="+")
         self.root.protocol("WM_DELETE_WINDOW", self._on_app_close)
 
 
@@ -544,6 +561,7 @@ import wallpaper_recolor.ui.mixins.layout as _mix_layout
 import wallpaper_recolor.ui.mixins.preview as _mix_preview
 import wallpaper_recolor.ui.mixins.ranges as _mix_ranges
 import wallpaper_recolor.ui.mixins.session as _mix_session
+import wallpaper_recolor.ui.mixins.swatch as _mix_swatch
 
 
 class _AppNameProxy:
@@ -564,6 +582,7 @@ for _mix in (
     _mix_preview,
     _mix_ranges,
     _mix_session,
+    _mix_swatch,
 ):
     for _name in (
         "build_range_map",

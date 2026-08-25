@@ -67,6 +67,7 @@ from wallpaper_recolor.color.color_ranges import (
     set_range_weight,
     snapshot_assignment,
     sync_centers_from_match,
+    canonicalize_split_method,
 )
 from wallpaper_recolor.ui.color_wheel import ColorWheel, rgb_to_hex
 from wallpaper_recolor.ui.cluster_view import (
@@ -76,9 +77,17 @@ from wallpaper_recolor.ui.cluster_view import (
     cluster_scatter_data,
 )
 from wallpaper_recolor.ui.coverage_bar import HALF_MATCH, HALF_REPLACE, CoverageBar
-from wallpaper_recolor.ui.tooltip import bind_tooltip
+from wallpaper_recolor.ui.tooltip import bind_tooltip, bind_menu_tooltips
 from wallpaper_recolor.io.export_layers_zip import export_layers_zip as write_layers_zip
 from wallpaper_recolor.io.export_pack import export_job_pack
+from wallpaper_recolor.io.proof import (
+    apply_icc,
+    icc_profiles_dir,
+    list_icc_profiles,
+    profile_menu_label,
+    profile_tooltip,
+    srgb_profile_tooltip,
+)
 from wallpaper_recolor.transform.crop import (
     CROP_XY_DEFAULT,
     ZOOM_DEFAULT,
@@ -405,13 +414,146 @@ class AppRangesMixin:
         if was_active and self.work_image is not None:
             self.rebuild_ranges()
 
-    def pick_icc(self) -> None:
-        """Printer ICC for a separate soft-proof in the job pack (RGB master stays)."""
-        path = filedialog.askopenfilename(title="Printer ICC profile", filetypes=ICC_FILETYPES)
-        if not path:
+    def pick_icc(self, event=None) -> str | None:
+        """Post the ICC profile dropdown at the toolbar button."""
+        menu = self._build_icc_menu()
+        btn = getattr(self, "icc_btn", None)
+        if menu is None or btn is None:
+            return "break"
+        try:
+            x = int(btn.winfo_rootx())
+            y = int(btn.winfo_rooty() + btn.winfo_height())
+        except tk.TclError:
+            if event is not None:
+                x, y = int(event.x_root), int(event.y_root)
+            else:
+                return "break"
+        try:
+            menu.tk_popup(x, y)
+        finally:
+            try:
+                menu.grab_release()
+            except tk.TclError:
+                pass
+        return "break"
+
+    def _icc_profiles_folder(self) -> Path:
+        override = getattr(self, "_icc_profiles_dir_override", None)
+        if override is not None:
+            return Path(override)
+        return icc_profiles_dir()
+
+    def _sync_icc_button(self) -> None:
+        btn = getattr(self, "icc_btn", None)
+        path = getattr(self, "icc_path", None)
+        label = "sRGB" if path is None else profile_menu_label(Path(path))
+        if len(label) > 28:
+            label = label[:27] + "…"
+        text = f"ICC profile ({label})"
+        choice = getattr(self, "icc_choice", None)
+        if choice is not None:
+            try:
+                choice.set("" if path is None else str(Path(path)))
+            except tk.TclError:
+                pass
+        if btn is None:
             return
-        self.icc_path = Path(path)
-        self.status.set(f"ICC proof profile: {self.icc_path.name}  (applied on Export job pack)")
+        try:
+            btn.configure(text=text)
+        except tk.TclError:
+            pass
+
+    def _build_icc_menu(self) -> tk.Menu:
+        """Fill ``icc_menu`` from the Color Profiles folder (sRGB always first)."""
+        parent = getattr(self, "icc_btn", None) or self.root
+        menu = getattr(self, "icc_menu", None)
+        if menu is None:
+            menu = tk.Menu(parent, tearoff=0)
+            self.icc_menu = menu
+        try:
+            menu.delete(0, "end")
+        except tk.TclError:
+            menu = tk.Menu(parent, tearoff=0)
+            self.icc_menu = menu
+        if getattr(self, "icc_choice", None) is None:
+            self.icc_choice = tk.StringVar(value="")
+        current = "" if self.icc_path is None else str(Path(self.icc_path))
+        try:
+            self.icc_choice.set(current)
+        except tk.TclError:
+            pass
+        tips: dict[int, str] = {}
+        menu.add_radiobutton(
+            label="sRGB",
+            variable=self.icc_choice,
+            value="",
+            command=lambda: self._on_icc_selected(None),
+        )
+        tips[0] = srgb_profile_tooltip()
+        folder = self._icc_profiles_folder()
+        profiles: list[Path] = []
+        folder_ok = False
+        try:
+            folder_ok = folder.is_dir()
+            if folder_ok:
+                profiles = list_icc_profiles(folder)
+        except OSError:
+            folder_ok = False
+            profiles = []
+        if not folder_ok:
+            menu.add_separator()
+            menu.add_command(label="Color Profiles folder not found", state="disabled")
+            tips[int(menu.index("end"))] = (
+                f"Looked for ICC files in {folder}. The folder is missing."
+            )
+        elif not profiles:
+            menu.add_separator()
+            menu.add_command(label="No ICC profiles in this folder", state="disabled")
+            tips[int(menu.index("end"))] = (
+                f"No .icc / .icm / ONYX .oml packs in {folder}. "
+                "Drop Canon Colorado M-series Onyx zip files here."
+            )
+        else:
+            menu.add_separator()
+            for path in profiles:
+                value = str(path)
+                menu.add_radiobutton(
+                    label=profile_menu_label(path),
+                    variable=self.icc_choice,
+                    value=value,
+                    command=lambda p=path: self._on_icc_selected(p),
+                )
+                tips[int(menu.index("end"))] = profile_tooltip(path)
+        bind_menu_tooltips(menu, tips)
+        return menu
+
+    def _on_icc_selected(self, path: Path | None) -> None:
+        """Apply the chosen working/output profile (undoable when a map exists)."""
+        if getattr(self, "_mute_ui", False) or getattr(self, "_history_lock", False):
+            return
+        new_path: Path | None = Path(path) if path is not None else None
+        old = getattr(self, "icc_path", None)
+        old_key = str(Path(old)) if old is not None else None
+        new_key = str(new_path) if new_path is not None else None
+        if old_key == new_key:
+            return
+        if new_path is not None:
+            probe = self.work_image if self.work_image is not None else self._work_live
+            if probe is not None:
+                try:
+                    apply_icc(probe, new_path)
+                except ValueError as exc:
+                    messagebox.showerror("ICC profile", str(exc), parent=self.root)
+                    self._sync_icc_button()
+                    return
+        before = self._capture_edit()
+        self.icc_path = new_path
+        self._sync_icc_button()
+        if self.work_image is not None and self.range_map is not None:
+            self._refresh_now()
+        self._push_undo_state(before)
+        name = "sRGB" if new_path is None else profile_menu_label(new_path)
+        self.status.set(f"ICC profile: {name}")
 
     def _sync_range_by_controls(self) -> None:
         """Assign when Range by is color; luma Min % + Start, or Lab Start, before Reset."""
@@ -449,8 +591,12 @@ class AppRangesMixin:
         lo = resolved_bin_start(method, None)
         if is_lab_channel_split(method):
             ch = split_axis_channel(method)
-            hi = 100.0 if ch == 0 else 127.0
-            lo_s = 0.0 if ch == 0 else -128.0
+            if ch == 0:
+                lo_s, hi = 0.0, 100.0
+            elif ch == 3:
+                lo_s, hi = 0.0, 180.0
+            else:
+                lo_s, hi = -128.0, 127.0
             inc = 1.0
         else:
             lo_s, hi, inc = 0.0, 255.0, 1.0
@@ -535,6 +681,7 @@ class AppRangesMixin:
 
     def _set_range_by_from_method(self, method: str) -> None:
         """Sync Range by: (and luma sub-option) from a ColorRangeMap split_method."""
+        method = canonicalize_split_method(method)
         self.range_by.set(range_by_label_for(method))
         if not is_color_split(method):
             self.luma_split_label.set(split_label_for(method))
@@ -545,6 +692,8 @@ class AppRangesMixin:
         by = self.range_by.get()
         if by == RANGE_BY_COLOR_LABEL:
             return SPLIT_COLOR_CLOSENESS
+        if by in (RANGE_BY_LAB_L_LABEL, "L split", "L"):
+            by = RANGE_BY_LUMA_LABEL
         pair = _RANGE_BY_BIN_METHODS.get(by)
         if pair is None:
             return SPLIT_COLOR_CLOSENESS
@@ -553,12 +702,102 @@ class AppRangesMixin:
             return pixel_m
         return equal_m
 
-    def _requested_count(self) -> int:
+    def _range_count_raw(self):
+        """IntVar or spinbox text; empty/invalid mid-edit is None (not DEFAULT 4)."""
         try:
-            n = int(self.range_count.get())
-        except (tk.TclError, ValueError):
+            return self.range_count.get()
+        except (tk.TclError, ValueError, TypeError):
+            spin = getattr(self, "range_spin", None)
+            if spin is None:
+                return None
+            try:
+                return spin.get()
+            except tk.TclError:
+                return None
+
+    def _parse_range_count(self, raw) -> int | None:
+        """Accept 3 or '3.0'. None when blank/garbage — do not snap to DEFAULT_RANGES."""
+        if raw is None or isinstance(raw, bool):
+            return None
+        if isinstance(raw, int):
+            return int(raw)
+        if isinstance(raw, float):
+            if not math.isfinite(raw):
+                return None
+            return int(round(raw))
+        text = str(raw).strip()
+        if not text:
+            return None
+        try:
+            return int(text)
+        except ValueError:
+            try:
+                value = float(text)
+            except ValueError:
+                return None
+            if not math.isfinite(value):
+                return None
+            return int(round(value))
+
+    def _committed_range_count(self) -> int:
+        """Map length when ranges exist; otherwise a clamped spinbox / default."""
+        if self.range_map is not None:
+            return max(MIN_RANGES, min(MAX_RANGES, len(self.range_map.ranges)))
+        n = self._parse_range_count(self._range_count_raw())
+        if n is None:
             n = DEFAULT_RANGES
         return max(MIN_RANGES, min(MAX_RANGES, n))
+
+    def _requested_count(self) -> int:
+        n = self._parse_range_count(self._range_count_raw())
+        if n is None:
+            n = self._committed_range_count()
+        return max(MIN_RANGES, min(MAX_RANGES, n))
+
+    def _cancel_range_spin_repeat(self) -> None:
+        """Stop ttk arrow auto-repeat so a slow rebuild cannot apply a second step."""
+        try:
+            self.root.tk.call("ttk::CancelRepeat")
+        except tk.TclError:
+            pass
+
+    def _nudge_range_count(self, delta: int) -> None:
+        """One arrow click / key step: change N by exactly ±1 within min/max."""
+        current = self._committed_range_count()
+        n = max(MIN_RANGES, min(MAX_RANGES, current + int(delta)))
+        self.range_count.set(n)
+        self._on_range_count()
+
+    def _on_range_spin_press(self, event) -> str | None:
+        """Arrow click: ±1 and break so ttk::Repeatedly cannot fire a second Increment."""
+        widget = getattr(event, "widget", None) or getattr(self, "range_spin", None)
+        if widget is None:
+            return None
+        try:
+            ident = str(widget.identify(getattr(event, "x", 0), getattr(event, "y", 0)) or "")
+        except tk.TclError:
+            return None
+        ident_l = ident.lower()
+        delta = 0
+        if "uparrow" in ident_l or "rightarrow" in ident_l:
+            delta = 1
+        elif "downarrow" in ident_l or "leftarrow" in ident_l:
+            delta = -1
+        elif "spinbutton" in ident_l:
+            try:
+                height = max(1, int(widget.winfo_height()))
+            except (tk.TclError, TypeError, ValueError):
+                height = 1
+            delta = -1 if int(getattr(event, "y", 0) or 0) * 2 >= height else 1
+        if not delta:
+            return None
+        self._cancel_range_spin_repeat()
+        try:
+            widget.focus_set()
+        except tk.TclError:
+            pass
+        self._nudge_range_count(delta)
+        return "break"
 
     def _should_auto_k(self) -> bool:
         """True for Generic cluster-from-image (not a named preset or luma/snap)."""
@@ -590,46 +829,60 @@ class AppRangesMixin:
         return self._apply_auto_k()
 
     def _on_range_count(self) -> None:
-        """Spinbox: insert/drop ranges without wiping existing match-from / change-to."""
+        """Spinbox: insert/drop ranges without wiping existing match-from / change-to.
+
+        User-chosen N is kept — silhouette / inertia auto-k is import / Generic only.
+        """
+        self._cancel_range_spin_repeat()
         if self._mute_ui or self._history_lock or getattr(self, "_opening", False):
             return
-        n = self._requested_count()
-        self.range_count.set(n)
-        if self.work_image is None:
+        if getattr(self, "_range_count_busy", False):
+            self.range_count.set(self._committed_range_count())
             return
-        if self.range_map is None:
-            self.rebuild_ranges()
-            return
-        current = len(self.range_map.ranges)
-        if n == current:
-            return
-        self._push_undo_state(self._capture_edit())
-        if n > current:
-            for _ in range(n - current):
-                insert_color_range(self.range_map)
-            self.selected_index = len(self.range_map.ranges) - 1
-            self.selected_half = HALF_REPLACE
-            self.status.set(
-                "Added a color range — pick a Pantone change-to. Other ranges kept their colors."
-            )
-        else:
-            for _ in range(current - n):
-                drop_color_range(self.range_map, len(self.range_map.ranges) - 1)
-            self.selected_index = min(self.selected_index, n - 1)
-            self.status.set("Removed a color range — remaining match-from / change-to kept.")
-        preset = get_preset(self.preset_id) if self.preset_id else None
-        if preset is not None and preset.range_count != n:
-            self._clear_preset_selection()
-        self._sync_texture_to_map()
-        self._rebuild_chips()
-        self._load_selected_onto_wheel()
-        self._sync_range_widgets(update_bar=True)
-        self._sync_range_layers()
-        self._refresh_layers_panel()
-        self._refresh_now()
+        self._range_count_busy = True
+        try:
+            n = self._requested_count()
+            self.range_count.set(n)
+            if self.work_image is None:
+                return
+            if self.range_map is None:
+                self.rebuild_ranges()
+                return
+            current = len(self.range_map.ranges)
+            if n == current:
+                return
+            self._push_undo_state(self._capture_edit())
+            if n > current:
+                for _ in range(n - current):
+                    insert_color_range(self.range_map)
+                self.selected_index = len(self.range_map.ranges) - 1
+                self.selected_half = HALF_REPLACE
+                self.status.set(
+                    "Added a color range — pick a Pantone change-to. Other ranges kept their colors."
+                )
+            else:
+                for _ in range(current - n):
+                    drop_color_range(self.range_map, len(self.range_map.ranges) - 1)
+                self.selected_index = min(self.selected_index, n - 1)
+                self.status.set("Removed a color range — remaining match-from / change-to kept.")
+            preset = get_preset(self.preset_id) if self.preset_id else None
+            if preset is not None and preset.range_count != n:
+                self._clear_preset_selection()
+            self._sync_texture_to_map()
+            self._rebuild_chips()
+            self._load_selected_onto_wheel()
+            self._sync_range_widgets(update_bar=True)
+            self._sync_range_layers()
+            self._refresh_layers_panel()
+            self._refresh_now()
+        finally:
+            self._range_count_busy = False
 
     def rebuild_ranges(self) -> None:
-        """Recompute clusters or luma bins. Colors reset unless a preset applies."""
+        """Recompute clusters or luma bins. Colors reset unless a preset applies.
+
+        Uses the spinbox N as-is. Auto-k is not applied here (open / Generic only).
+        """
         if self.work_image is None:
             return
         if self.range_map is not None and not self._history_lock and not self._opening:
@@ -796,7 +1049,7 @@ class AppRangesMixin:
         before = self._capture_edit() if record else None
         self.range_map.set_replacement(index, rgb)
         self._sync_range_widgets(update_bar=True, update_slider=False)
-        self._schedule_preview()
+        self._preview_after_color()
         if record:
             self._push_undo_state(before)
 
@@ -810,7 +1063,7 @@ class AppRangesMixin:
         if is_color_split(self.range_map.split_method):
             apply_weights(self.range_map, self.range_map.weights())
         self._sync_range_widgets(update_bar=True, update_slider=False)
-        self._schedule_preview()
+        self._preview_after_color()
         if record:
             self._push_undo_state(before)
 
@@ -868,7 +1121,7 @@ class AppRangesMixin:
             if ly is not None:
                 ly.color = tuple(int(c) for c in rgb)
                 self._sync_label_fields_from_layer(ly)
-                self._schedule_preview()
+                self._preview_after_color()
             return
         if self.range_map is None:
             return
@@ -879,9 +1132,21 @@ class AppRangesMixin:
             self._wheel_before = self._capture_edit()
         self.set_range_color(self.selected_index, rgb)
 
+    def _preview_after_color(self) -> None:
+        """Show the new swatch now unless the wheel / mix slider is mid-drag."""
+        wheel = getattr(self, "wheel", None)
+        dragging = bool(
+            getattr(wheel, "_drag", None) or getattr(wheel, "_bar_drag", None)
+        )
+        if dragging:
+            self._schedule_preview()
+            return
+        self._refresh_now()
+
     def _on_wheel_commit(self, rgb: tuple[int, int, int]) -> None:
         """One undo tick after wheel release / hex / shade — not every drag pixel."""
         self.wheel.record_color(rgb)
+        self._refresh_now()
         if not self._has_range_selection() and not primary_is_label(self.layer_stack):
             self._wheel_before = None
             return

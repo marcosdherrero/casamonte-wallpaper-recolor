@@ -364,6 +364,16 @@ class CoverageBar(ttk.Frame):
                 outline="",
                 tags=(f"seg{i}r", "replace"),
             )
+            # Visible BL→TR seam so match-from and change-to stay distinct.
+            canvas.create_line(
+                x,
+                height,
+                x1,
+                0,
+                fill="#111111",
+                width=2,
+                tags=(f"seg{i}diag", "diag"),
+            )
             shown = self.visibilities[i] if i < len(self.visibilities) else True
             if not shown:
                 canvas.create_rectangle(x, 0, x1, height, fill="#888888", stipple="gray50", outline="")

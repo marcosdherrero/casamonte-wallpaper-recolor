@@ -126,3 +126,4 @@ class EditSnapshot:
     tone_balance_yellow: float = 0.0
     bin_start: float | None = None
     min_coverage: float = MIN_COVERAGE
+    icc_path: str | None = None

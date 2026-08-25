@@ -7,10 +7,14 @@ Build (except Detail mosaic, which still needs Build).
 
 **Tile (Repeating Design)** (default): estimate the motif period from the
 image (1D autocorrelation on a probe), crop to a whole number of repeats,
-and fill leftover edge strips by wrapping/copying that motif (resize the
-integer-period core to the crop frame when leftover is more than a rounding
-pixel). Result left↔right and top↔bottom match. Already-periodic crops
-are a no-op.
+and fill leftover edge strips by wrapping/copying that motif. Stretching
+the core to the frame would break the period so a 3×3 / Offset seam
+fails. Then roll the tile so opposite edges meet in the middle and
+inpaint that plus-shaped seam with LaMa (OpenCV / period-Hilbert fallback)
+using the surrounding motif as context — not just cloning one corner onto
+the other. Result left↔right and top↔bottom match. Already-periodic crops
+(whole repeats whose cells match) are a no-op. Matching opposite *edges*
+alone is not enough — a studio bowl makes both edges dark.
 
 **Tessellation**: Hilbert (crinkly) diffuse from the chosen H/V sides;
 opposite side is the model. Mix weights follow a Hilbert front — locality-
@@ -28,11 +32,11 @@ crop and Hilbert-diffuses (Tessellation) unless opposite edges already
 tile — mosaic alone is not a seamless repeat.
 
 Horizontal and vertical are independent (Left+Top is a combo). Pipeline:
-remap/tone (Darks/Lights carry optional lighting flatten) → Crop →
-tessellate if Built → output Scale. Normalize lighting estimates a Lab
-bowl + bilinear + opposite-edge flatten, then sets Tone sliders — it does
-not require Build and Build does not imply flatten. Vectorized numpy
-(strip processing) so print-size images stay off the Python pixel loop.
+remap/tone → Crop → optional lighting flatten → tessellate if Built →
+output Scale. Normalize lighting divides out a Lab bowl + bilinear ramp
+and matches opposite edges so a 3×3 / Offset tile is even. It does not
+require Build; Build does not imply flatten. Vectorized numpy (strip
+processing) so print-size images stay off the Python pixel loop.
 
 Class references (code + name only):
 - CAP3321C Data Wrangling
@@ -244,7 +248,7 @@ def tess_mode_label(mode: str | None) -> str:
 
 
 def coerce_normalize_lighting(value: object) -> bool:
-    """True after Normalize lighting has been applied (Darks/Lights carry it)."""
+    """True when spatial lighting flatten (bowl / ramp) is on."""
     if isinstance(value, bool):
         return value
     if isinstance(value, (str, bytes)):
@@ -268,8 +272,8 @@ def is_identity_tessellate(
 
     Tile, Tessellation, and Mesh still need a chosen side. Detail mosaic
     runs with sides Off (density-only, like the source script).
-    ``normalize_lighting`` is ignored — flatten is a separate pipeline
-    step and never implies wrap.
+    ``normalize_lighting`` is ignored here — flatten is a separate
+    pipeline step and never implies wrap.
     """
     del normalize_lighting
     if not coerce_built(built):
@@ -483,8 +487,8 @@ def apply_normalize_lighting(image: Image.Image) -> Image.Image:
 def estimate_normalize_tone(image: Image.Image) -> tuple[float, float]:
     """Darks / Lights (−1…+1) that approximate flatten via existing Tone math.
 
-    Flatten itself is not applied on preview/save — Tone sliders carry the
-    grade so Darks/Lights stay the single lighting path. Brightness stays 0.
+    Preview/save apply ``apply_normalize_lighting`` as a spatial step;
+    this estimate is only for callers that still map flatten onto sliders.
     A flatten that lifts shadows writes negative Darks (left = pull darks
     back) so the slider matches the inverted Darks mix.
     """
@@ -780,12 +784,14 @@ def image_already_periodic(
     h_side: str | None,
     v_side: str | None,
 ) -> bool:
-    """True when chosen wrap axes are already a whole number of repeats."""
+    """True when chosen wrap axes are already a whole number of repeats.
+
+    Opposite-edge agreement alone is not enough: a studio lighting bowl
+    makes left≈right (both dark) while the weave still fails to wrap.
+    """
     h_side = normalize_h_side(h_side)
     v_side = normalize_v_side(v_side)
     if h_side == SIDE_OFF and v_side == SIDE_OFF:
-        return True
-    if edges_already_match(arr, h_side, v_side):
         return True
     height, width = int(arr.shape[0]), int(arr.shape[1])
     if h_side != SIDE_OFF:
@@ -931,24 +937,73 @@ def _copy_fill_leftover(
     h_on: bool,
     v_on: bool,
 ) -> np.ndarray:
-    """Paste motif wrap into leftover strips; keep the integer-repeat core."""
+    """Paste motif wrap into leftover strips; keep the integer-repeat core.
+
+    Never resize a leftover band (or repeat one column). Stretching a 1-wide
+    source turns horizontal linen grain into vertical streaks along the edge.
+    """
     out = np.array(arr, copy=True)
     height, width = int(arr.shape[0]), int(arr.shape[1])
     ox, cw = int(ox), max(1, int(cw))
     oy, ch = int(oy), max(1, int(ch))
-    if h_on and cw >= 1:
+    if h_on and cw >= 2 and cw < width:
         xs = np.arange(width, dtype=np.int64)
         hole = (xs < ox) | (xs >= ox + cw)
         if np.any(hole):
             src = ox + np.mod(xs - ox, cw)
-            out[:, hole] = arr[:, src[hole]]
-    if v_on and ch >= 1:
+            src = np.clip(src, 0, width - 1)
+            # One unique source column would smear leftover into vertical streaks.
+            if int(np.unique(src[hole]).size) >= 2 or int(np.count_nonzero(hole)) <= 2:
+                out[:, hole] = arr[:, src[hole]]
+    if v_on and ch >= 2 and ch < height:
         ys = np.arange(height, dtype=np.int64)
         hole = (ys < oy) | (ys >= oy + ch)
         if np.any(hole):
             src = oy + np.mod(ys - oy, ch)
-            out[hole] = out[src[hole]]
+            src = np.clip(src, 0, height - 1)
+            if int(np.unique(src[hole]).size) >= 2 or int(np.count_nonzero(hole)) <= 2:
+                out[hole] = out[src[hole]]
     return out
+
+
+def _fit_frame_by_wrap(
+    arr: np.ndarray,
+    src_h: int,
+    src_w: int,
+    h_side: str,
+    v_side: str,
+) -> np.ndarray:
+    """Restore the source frame by wrapping the motif — never bilinear leftover."""
+    height, width = int(arr.shape[0]), int(arr.shape[1])
+    src_h, src_w = max(1, int(src_h)), max(1, int(src_w))
+    if height == src_h and width == src_w:
+        return arr
+    if height >= src_h and width >= src_w:
+        y0 = height - src_h if v_side == SIDE_BOTTOM else 0
+        x0 = width - src_w if h_side == SIDE_RIGHT else 0
+        y0 = max(0, min(y0, height - src_h))
+        x0 = max(0, min(x0, width - src_w))
+        return np.array(arr[y0 : y0 + src_h, x0 : x0 + src_w], copy=True)
+    if arr.ndim == 2:
+        canvas = np.zeros((src_h, src_w), dtype=arr.dtype)
+    else:
+        canvas = np.zeros((src_h, src_w) + arr.shape[2:], dtype=arr.dtype)
+    paste_h = min(height, src_h)
+    paste_w = min(width, src_w)
+    ox = src_w - paste_w if h_side == SIDE_RIGHT else 0
+    oy = src_h - paste_h if v_side == SIDE_BOTTOM else 0
+    ox = max(0, min(ox, src_w - paste_w))
+    oy = max(0, min(oy, src_h - paste_h))
+    canvas[oy : oy + paste_h, ox : ox + paste_w] = arr[:paste_h, :paste_w]
+    return _copy_fill_leftover(
+        canvas,
+        ox,
+        paste_w,
+        oy,
+        paste_h,
+        h_side != SIDE_OFF and paste_w < src_w,
+        v_side != SIDE_OFF and paste_h < src_h,
+    )
 
 
 def _tile_from_pattern(
@@ -958,7 +1013,7 @@ def _tile_from_pattern(
     *,
     nearest: bool,
 ) -> np.ndarray:
-    """Crop to whole repeats, copy leftover from the motif, resize to the frame."""
+    """Crop to whole repeats and copy leftover from the motif (do not stretch)."""
     height, width = int(arr.shape[0]), int(arr.shape[1])
     px = estimate_axis_period(arr, 1) if h_side != SIDE_OFF else width
     py = estimate_axis_period(arr, 0) if v_side != SIDE_OFF else height
@@ -974,15 +1029,33 @@ def _tile_from_pattern(
     )
     cw = max(1, min(cw, width - ox))
     ch = max(1, min(ch, height - oy))
-    leftover = (width - cw) + (height - ch)
-    if leftover <= 2:
-        out = _copy_fill_leftover(
-            arr, ox, cw, oy, ch, h_side != SIDE_OFF, v_side != SIDE_OFF
-        )
-    else:
-        core = arr[oy : oy + ch, ox : ox + cw]
-        out = _resize_hw(core, height, width, nearest=nearest)
+    out = _copy_fill_leftover(
+        arr, ox, cw, oy, ch, h_side != SIDE_OFF, v_side != SIDE_OFF
+    )
+    if not nearest:
+        out = _seal_wrap_axes(out, h_side, v_side)
+        out = _refine_tile_seams_ai(out, h_side, v_side)
     return _pin_wrap_edges(out, h_side, v_side)
+
+
+def _refine_tile_seams_ai(arr: np.ndarray, h_side: str, v_side: str) -> np.ndarray:
+    """LaMa (or period/Hilbert) on rolled wrap seams — both edges as context.
+
+    Leftover copy only sees one corner of this scan. Rolling the tile puts
+    opposite edges together so inpaint can synthesize the join from the
+    surrounding motif instead of cloning that corner.
+    """
+    if h_side == SIDE_OFF and v_side == SIDE_OFF:
+        return arr
+    try:
+        from wallpaper_recolor.transform.inpaint import inpaint_wrap_seams
+    except ImportError:
+        return arr
+    return inpaint_wrap_seams(
+        arr,
+        wrap_h=h_side != SIDE_OFF,
+        wrap_v=v_side != SIDE_OFF,
+    )
 
 
 def _tile_wrap_if_needed(
@@ -1763,8 +1836,9 @@ def apply_tessellate(
 
     Does not flatten lighting — that is ``apply_normalize_lighting``, a
     separate pipeline step. Tile mode wraps by repeating the detected
-    motif. Tessellation Hilbert-diffuses toward the opposite side.
-    Already-matching / already-periodic edges are a no-op.
+    motif, then inpaints the wrap seam (LaMa when cached). Tessellation
+    Hilbert-diffuses toward the opposite side. Already-matching /
+    already-periodic edges are a no-op.
     """
     h_side = normalize_h_side(h_side)
     v_side = normalize_v_side(v_side)
@@ -1785,14 +1859,10 @@ def apply_tessellate(
     )
     if out is arr:
         return image
-    result = Image.fromarray(out, mode=image.mode)
-    if result.size != (src_w, src_h):
-        result = result.resize((src_w, src_h), Image.Resampling.BILINEAR)
-        result = Image.fromarray(
-            _pin_wrap_edges(np.asarray(result), h_side, v_side),
-            mode=image.mode,
-        )
-    return result
+    if int(out.shape[0]) != src_h or int(out.shape[1]) != src_w:
+        out = _fit_frame_by_wrap(out, src_h, src_w, h_side, v_side)
+        out = _pin_wrap_edges(out, h_side, v_side)
+    return Image.fromarray(out, mode=image.mode)
 
 
 def apply_crop_lighting_tessellate(
@@ -1810,13 +1880,14 @@ def apply_crop_lighting_tessellate(
     normalize_lighting: object = False,
     src_size: tuple[int, int] | None = None,
 ) -> Image.Image:
-    """Crop → tessellate. Lighting flatten is Tone (Darks/Lights), not a second pass.
+    """Crop → optional lighting flatten → tessellate.
 
-    ``normalize_lighting`` is ignored so flatten cannot stack on the same
-    slider amounts. Estimate via ``estimate_normalize_tone`` and apply Tone.
+    Flatten removes the studio bowl so 3×3 / Offset tiles stay even.
+    Darks/Lights remain a separate grade and are not written here.
     """
-    del normalize_lighting
     image = apply_crop(image, crop_x, crop_y, crop_zoom, src_size=src_size)
+    if coerce_normalize_lighting(normalize_lighting):
+        image = apply_normalize_lighting(image)
     return apply_tessellate(
         image,
         h_side,

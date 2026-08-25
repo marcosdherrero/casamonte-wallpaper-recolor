@@ -16,6 +16,7 @@ Class references (code + name only):
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import TYPE_CHECKING
 import tkinter as tk
 from tkinter import ttk
@@ -211,16 +212,115 @@ def _scale_view_zoom(
     return image.resize(target, Image.Resampling.NEAREST)
 
 
+HIT_PREVIEW = "preview"
+HIT_SLIDER = "slider"
+HIT_SIDEBAR = "sidebar"
+HIT_NONE = "none"
+_WP_TOOLTIP_ATTR = "_wp_tooltip"
+
+
 def _widget_contains_root(widget: tk.Misc, x_root: int, y_root: int) -> bool:
-    """True if screen point ``(x_root, y_root)`` lies on ``widget``."""
+    """True if screen point ``(x_root, y_root)`` lies on ``widget``.
+
+    Unmapped 1×1 widgets must not match ``(0, 0)``. ``winfo_containing`` is
+    not used here — grab / focus / tooltip balloons poison it on Windows.
+    """
     try:
+        viewable = getattr(widget, "winfo_viewable", None)
+        if callable(viewable) and not viewable():
+            return False
         x0 = int(widget.winfo_rootx())
         y0 = int(widget.winfo_rooty())
-        w = max(1, int(widget.winfo_width()))
-        h = max(1, int(widget.winfo_height()))
-    except tk.TclError:
+        w = int(widget.winfo_width())
+        h = int(widget.winfo_height())
+    except (tk.TclError, TypeError, ValueError, AttributeError):
+        return False
+    if w <= 0 or h <= 0:
         return False
     return x0 <= int(x_root) < x0 + w and y0 <= int(y_root) < y0 + h
+
+
+def _is_pointer_overlay(widget: tk.Misc | None) -> bool:
+    """True for tooltip balloons (they must not steal hit-tests)."""
+    current: tk.Misc | None = widget
+    seen: set[str] = set()
+    while current is not None:
+        if getattr(current, _WP_TOOLTIP_ATTR, False):
+            return True
+        try:
+            key = str(current)
+        except (tk.TclError, TypeError):
+            break
+        if key in seen:
+            break
+        seen.add(key)
+        current = getattr(current, "master", None)
+    return False
+
+
+def _is_independent_toplevel(widget: tk.Misc) -> bool:
+    try:
+        return widget.winfo_toplevel() is widget
+    except (tk.TclError, AttributeError):
+        return False
+
+
+def widget_at_root(root: tk.Misc, x_root: int, y_root: int) -> tk.Misc | None:
+    """Deepest mapped widget at a screen point, ignoring tooltip balloons.
+
+    Walks geometry (not ``winfo_containing``) so a leftover grab or the
+    last focused control cannot keep the pointer pinned after a click.
+    """
+    x, y = int(x_root), int(y_root)
+    best: tk.Misc | None = None
+
+    def walk(widget: tk.Misc) -> None:
+        nonlocal best
+        if getattr(widget, _WP_TOOLTIP_ATTR, False):
+            return
+        try:
+            if not widget.winfo_ismapped():
+                return
+        except (tk.TclError, AttributeError):
+            return
+        contains = _widget_contains_root(widget, x, y)
+        try:
+            children = list(widget.winfo_children())
+        except (tk.TclError, AttributeError):
+            children = []
+        if contains:
+            best = widget
+            for child in reversed(children):
+                walk(child)
+            return
+        for child in children:
+            if _is_independent_toplevel(child):
+                walk(child)
+
+    walk(root)
+    return best
+
+
+def classify_pointer_hit(
+    x: int,
+    y: int,
+    *,
+    preview: Sequence[tk.Misc] = (),
+    sliders: Sequence[tk.Misc] = (),
+    sidebars: Sequence[tk.Misc] = (),
+) -> str:
+    """Point → preview (wheel zoom) vs slider vs sidebar (column scroll)."""
+    xr, yr = int(x), int(y)
+    for widget in preview:
+        if _widget_contains_root(widget, xr, yr):
+            return HIT_PREVIEW
+    for widget in sliders:
+        if _widget_contains_root(widget, xr, yr):
+            return HIT_SLIDER
+    for widget in sidebars:
+        if _widget_contains_root(widget, xr, yr):
+            return HIT_SIDEBAR
+    return HIT_NONE
 
 
 def _wheel_zoom_pct_delta(event) -> float:
@@ -286,7 +386,7 @@ class PreviewZoomHost(tk.Frame):
         self.rowconfigure(0, weight=1)
         self.columnconfigure(0, weight=1)
         # tk.Label (not ttk): theme styles ignore background, which made
-        # letterbox look black on one pane and gray on the other.
+        # letterbox look black on one pane and chrome-gray on the other.
         self.image_label = tk.Label(
             self.viewport,
             bg=bg,
@@ -497,7 +597,13 @@ class PreviewZoomHost(tk.Frame):
     def _want_rect(self) -> bool:
         if self.on_rect is None:
             return False
-        return bool(self.rect_mode) or not self.can_pan()
+        if self.rect_mode:
+            return True
+        # Select-area mode owns the drag. Grab Move must still reposition
+        # overlays at 100% Fit, where can_pan() is False.
+        if self.app._grab_move_on():
+            return False
+        return not self.can_pan()
 
     def _ensure_rect_guides(self) -> tuple[tk.Frame, tk.Frame, tk.Frame, tk.Frame]:
         if self._rect_guides is None:
@@ -543,12 +649,13 @@ class PreviewZoomHost(tk.Frame):
         self._press = (int(event.x_root), int(event.y_root))
         self.panning = False
         self.moving_layer = False
-        self._rect_start = self._event_label_xy(event) if self._want_rect() else None
+        want_rect = self._want_rect() and not self.app._grab_moves_layer(host=self)
+        self._rect_start = self._event_label_xy(event) if want_rect else None
         if self._rect_start is None:
             self._hide_drag_rect()
 
     def _on_drag(self, event) -> None:
-        if self._rect_start is not None:
+        if self._rect_start is not None and not self.app._grab_moves_layer(host=self):
             x1, y1 = self._event_label_xy(event)
             self._show_drag_rect(self._rect_start[0], self._rect_start[1], x1, y1)
             return
@@ -563,12 +670,13 @@ class PreviewZoomHost(tk.Frame):
             and dx * dx + dy * dy < _PREVIEW_PAN_DRAG_PX * _PREVIEW_PAN_DRAG_PX
         ):
             return
-        if self.app._grab_move_on():
+        if self.app._grab_moves_layer(host=self):
             self.moving_layer = True
             self._press = (x, y)
             self.app._nudge_grab_move(dx, dy, host=self)
             return
-        if not self.app._view_move_on() or not self.can_pan():
+        pan = self.app._view_move_on() or self.app._grab_move_on()
+        if not pan or not self.can_pan():
             return
         self.panning = True
         self._pan_x -= dx
